@@ -50,6 +50,7 @@ class Task:
     updated_at: str
     parent_task_id: str | None = None
     thread_a_msg_id: str | None = None
+    thread_a_chat_id: str | None = None
     group_chat_id: str | None = None
     topic_root_msg_id: str | None = None
     doc_links: list = None  # type: ignore[assignment]
@@ -114,6 +115,7 @@ def create_task(
     message_id: str,
     event_id: str,
     thread_a_msg_id: str | None = None,
+    thread_a_chat_id: str | None = None,
     parent_task_id: str | None = None,
     payload: dict | None = None,
 ) -> Task:
@@ -129,8 +131,9 @@ def create_task(
     taskid = allocate_taskid(conn, today)
     conn.execute(
         "INSERT INTO tasks (taskid, parent_task_id, type, title, thread_a_msg_id,"
-        " status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
-        (taskid, parent_task_id, type, title, thread_a_msg_id, "received", now, now),
+        " thread_a_chat_id, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (taskid, parent_task_id, type, title, thread_a_msg_id, thread_a_chat_id,
+         "received", now, now),
     )
     conn.execute(
         "INSERT OR IGNORE INTO inbox_events"

@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     type              TEXT NOT NULL,
     title             TEXT NOT NULL,
     thread_a_msg_id   TEXT,
+    thread_a_chat_id  TEXT,
     group_chat_id     TEXT,
     topic_root_msg_id TEXT,
     doc_links         TEXT DEFAULT '[]',
