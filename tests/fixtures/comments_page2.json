@@ -1,0 +1,15 @@
+{
+  "data": {
+    "items": [
+      {
+        "comment_id": "com_2",
+        "user_id": "ou_elio",
+        "content": "总体方向 Get",
+        "is_solved": true,
+        "reactions": [{"emoji_type": "OK", "user_id": "ou_elio"}],
+        "reply_list": {"replies": [], "has_more": false}
+      }
+    ],
+    "has_more": false
+  }
+}

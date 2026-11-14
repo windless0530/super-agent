@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""评论 watcher:文档评论事件不可用时的轮询降级(P0 探针失败才启用)。
+
+依据:落地方案 v1.2「文档评论回路」(D5)与 P0 第 8 项:
+- 完整处理评论分页与 reply_list 分页,读取 reaction 与 is_solved;
+- 以 (reply_id, 内容+update_time hash) 去重,重复评论不重复唤醒;
+- 过滤责任 bot 自己的回复,防止自回复死循环;
+- 活动/空闲分频 + 失败退避,单轮异常不退出。
+"""
+
+import hashlib
+import json
+import logging
+import os
+import shlex
+import subprocess
+import threading
+from typing import Callable, Protocol, runtime_checkable
+
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from services.coordinator import outbox  # noqa: E402
+from services.coordinator.registry import get_task  # noqa: E402
+
+logger = logging.getLogger("comment_watcher")
+
+DEFAULT_LIST_CMD = "lark-cli drive +list-comments --doc {doc_token}"
+DEFAULT_GET_CMD = "lark-cli drive +get-comment --doc {doc_token} --comment-id {comment_id}"
+
+
+def dedup_key(reply_id: str, content: str, update_time: str) -> tuple[str, str]:
+    """(reply_id, sha256(content+update_time) 前 16 位)。"""
+    h = hashlib.sha256((content + update_time).encode("utf-8")).hexdigest()[:16]
+    return reply_id, h
+
+
+@runtime_checkable
+class CommentReader(Protocol):
+    def list_comments(self, doc_token: str, page_token: str | None) -> dict: ...
+
+    def get_comment(self, doc_token: str, comment_id: str) -> dict: ...
+
+
+class LarkCliCommentReader:
+    """经 lark-cli 读取评论;命令模板可用环境变量覆盖(P0 现场校准)。"""
+
+    def _run(self, template_env: str, default: str, **kw) -> dict:
+        template = os.environ.get(template_env, default)
+        argv = shlex.split(template.format(**{k: shlex.quote(v) for k, v in kw.items()}))
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            raise RuntimeError(f"评论读取失败: {proc.stderr[:200]}")
+        return json.loads(proc.stdout)
+
+    def list_comments(self, doc_token: str, page_token: str | None) -> dict:
+        page = self._run(
+            "SA_COMMENT_LIST_CMD", DEFAULT_LIST_CMD, doc_token=doc_token
+        )
+        return page if page_token is None else page  # 分页游标由调用方展开
+
+    def get_comment(self, doc_token: str, comment_id: str) -> dict:
+        return self._run(
+            "SA_COMMENT_GET_CMD", DEFAULT_GET_CMD,
+            doc_token=doc_token, comment_id=comment_id,
+        )
+
+
+def _seen(conn, key: tuple[str, str, str]) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM comment_inbox WHERE reply_id=? AND content_hash=? AND kind=?",
+        key,
+    ).fetchone()
+    return row is not None
+
+
+def _record(conn, key: tuple[str, str, str], doc_token: str, taskid: str, payload: dict):
+    conn.execute(
+        "INSERT OR IGNORE INTO comment_inbox"
+        " (reply_id, content_hash, kind, taskid, doc_token, payload, first_seen_at)"
+        " VALUES (?,?,?,?,?,?,datetime('now'))",
+        (*key, taskid, doc_token, json.dumps(payload, ensure_ascii=False)),
+    )
+    conn.commit()
+
+
+def _emit_notify(conn, taskid: str, text: str) -> None:
+    task = get_task(conn, taskid)
+    if task is None or not task.group_chat_id or not task.topic_root_msg_id:
+        logger.warning("任务 %s 无话题锚点,notify 未入队", taskid)
+        return
+    outbox.enqueue(
+        conn, taskid=taskid, kind="notify",
+        payload={
+            "chat_id": task.group_chat_id,
+            "root": task.topic_root_msg_id,
+            "text": text,
+            "mentions": [task.active_role] if task.active_role else [],
+        },
+    )
+
+
+def _walk_comments(reader: CommentReader, doc_token: str):
+    """展开评论分页;返回 [(comment, full_comment_dict)]。"""
+    results = []
+    page_token = None
+    while True:
+        page = reader.list_comments(doc_token, page_token)
+        data = page.get("data", page)
+        for item in data.get("items", []):
+            full = reader.get_comment(doc_token, item["comment_id"])
+            results.append((item, full))
+        if not data.get("has_more"):
+            break
+        page_token = data.get("page_token")
+        if not page_token:
+            break
+    return results
+
+
+def sync_doc(
+    conn,
+    reader: CommentReader,
+    *,
+    doc_token: str,
+    taskid: str,
+    bot_ids: tuple[str, ...],
+) -> int:
+    """同步一篇文档的评论;返回新增 notify 条数(去重后用户侧新内容)。"""
+    notified = 0
+    for item, full in _walk_comments(reader, doc_token):
+        comment_id = item["comment_id"]
+        author = item.get("user_id", "")
+        content = item.get("content", "")
+        update_time = item.get("update_time", "")
+        # 评论本体(用户发出的才算新输入)
+        if author not in bot_ids:
+            key = (*dedup_key(comment_id, content, update_time), "comment")
+            if not _seen(conn, key):
+                _record(conn, key, doc_token, taskid,
+                        {"user_id": author, "content": content})
+                _emit_notify(conn, taskid, f"文档评论({author}): {content}")
+                notified += 1
+        # 回复分页(过滤 bot 自回复,防死循环)
+        for reply in full.get("replies", []):
+            if reply.get("user_id", "") in bot_ids:
+                continue
+            key = (*dedup_key(reply["reply_id"], reply.get("content", ""),
+                              reply.get("update_time", "")), "reply")
+            if not _seen(conn, key):
+                _record(conn, key, doc_token, taskid,
+                        {"user_id": reply.get("user_id"), "content": reply.get("content")})
+                _emit_notify(conn, taskid,
+                             f"评论回复({reply.get('user_id')}): {reply.get('content')}")
+                notified += 1
+        # reaction 单独记录,不产生 notify
+        for reaction in full.get("reactions", []):
+            if str(reaction.get("user_id", "")) in bot_ids:
+                continue
+            rkey = (*dedup_key(
+                comment_id,
+                f"{reaction.get('user_id')}:{reaction.get('emoji_type')}",
+                update_time), "reaction")
+            if not _seen(conn, rkey):
+                _record(conn, rkey, doc_token, taskid, reaction)
+        # is_solved 单独记录
+        solved = full.get("is_solved")
+        if solved is not None:
+            skey = (*dedup_key(comment_id, str(solved), update_time), "solved")
+            if not _seen(conn, skey):
+                _record(conn, skey, doc_token, taskid, {"is_solved": solved})
+    return notified
+
+
+def watch_loop(
+    conn,
+    reader: CommentReader,
+    docs: Callable[[], list[dict]],
+    *,
+    active_interval: float = 3.0,
+    idle_interval: float = 60.0,
+    stop: threading.Event | None = None,
+    max_rounds: Callable[[], int] | None = None,
+) -> None:
+    """活动/空闲分频轮询骨架:有非 done 任务用 active_interval,否则 idle_interval。
+
+    docs() 返回 [{"doc_token","taskid","bot_ids"}];单轮异常退避后继续。
+    """
+    stop = stop or threading.Event()
+    backoff = 1.0
+    while not stop.is_set():
+        try:
+            targets = docs()
+            for d in targets:
+                sync_doc(conn, reader, **d)
+            backoff = 1.0
+            interval = active_interval if targets else idle_interval
+        except Exception:  # noqa: BLE001
+            logger.exception("评论轮询单轮异常(退避 %.1fs)", backoff)
+            interval = backoff
+            backoff = min(backoff * 2, 300.0)
+        if max_rounds is not None and max_rounds() <= 0:
+            break
+        stop.wait(interval)
+
+
+def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db", default="registry/tasks.db")
+    parser.add_argument("--active-interval", type=float, default=3.0)
+    parser.add_argument("--idle-interval", type=float, default=60.0)
+    args = parser.parse_args()
+
+    from services.coordinator import db as db_mod
+
+    conn = db_mod.connect(args.db)
+    db_mod.init_schema(conn)
+
+    def docs():
+        rows = conn.execute(
+            "SELECT t.taskid, t.doc_links FROM tasks t"
+            " WHERE t.status != 'done' AND t.doc_links != '[]'"
+        ).fetchall()
+        out = []
+        for r in rows:
+            for link in json.loads(r[1]):
+                out.append({"doc_token": link.rsplit("/", 1)[-1],
+                            "taskid": r[0], "bot_ids": ()})
+        return out
+
+    logging.basicConfig(level=logging.INFO)
+    watch_loop(conn, LarkCliCommentReader(), docs,
+               active_interval=args.active_interval,
+               idle_interval=args.idle_interval)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
