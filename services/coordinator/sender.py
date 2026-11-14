@@ -89,13 +89,16 @@ class LarkCliSender:
         return self._template("SA_SEND_CMD", DEFAULT_SEND_CMD)
 
     def _base_argv(self, chat_id: str, text: str, template: str) -> list[str]:
-        # format_map 容忍全部占位符;缺省键给空串再过滤,避免模板含 {text} 时报错
+        # format_map 容忍全部占位符;全部值先 shlex.quote,
+        # 模板含 {text} 时空格/flag 注入被引号挡住,保持单元素
         class _Safe(dict):
             def __missing__(self, key):
                 return ""
 
         rendered = template.format_map(
-            _Safe(bot=self.sender_bot, chat_id=chat_id, text=text)
+            _Safe(bot=shlex.quote(self.sender_bot),
+                  chat_id=shlex.quote(chat_id),
+                  text=shlex.quote(text))
         )
         return [a for a in shlex.split(rendered) if a]
 
@@ -135,5 +138,9 @@ class LarkCliSender:
     def _extract(self, stdout: str, argv: list[str]) -> str:
         msg_id = parse_send_output(stdout)
         if msg_id is None:
-            raise SendError(argv, 0, f"无法从输出提取 message_id: {stdout[:200]}")
+            # rc=0 意味着消息大概率已发出,解析失败只是输出格式不符:
+            # 归类为模糊失败(重发前必须对账),不能当确定失败盲目重发
+            raise AmbiguousSendError(
+                argv, 0, f"无法从输出提取 message_id: {stdout[:200]}"
+            )
         return msg_id

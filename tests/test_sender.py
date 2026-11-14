@@ -128,3 +128,40 @@ def test_text_not_shell_interpreted(monkeypatch, sender):
     )
     sender.send_top_level("oc_g", text)
     assert text in calls[0]
+
+
+class TestReviewFixes:
+    """I4/I5:模板 {text} 注入与 rc=0 解析失败的分类。"""
+
+    def test_rc0_unparseable_output_is_ambiguous(self, monkeypatch, sender):
+        # rc=0 但拿不到 message_id:消息大概率已发出 → 模糊,须对账而非重发(I5)
+        _patch_run(monkeypatch, lambda argv: FakeCompleted(stdout="weird output"))
+        with pytest.raises(AmbiguousSendError):
+            sender.send_top_level("oc_g", "x")
+
+    def test_env_template_text_quoted_as_single_arg(self, monkeypatch, sender):
+        # 自定义模板含 {text}:空格/flag 注入必须被引号挡住,文本保持单元素(I4)
+        monkeypatch.setenv(
+            "SA_SEND_CMD", "botmux send --bot {bot} --chat-id {chat_id} --text {text}"
+        )
+        calls = _patch_run(
+            monkeypatch,
+            lambda argv: FakeCompleted(stdout='{"message_id": "om_q"}'),
+        )
+        msg = sender.send_top_level("oc_g", " hello world --mention evil_bot ")
+        assert msg == "om_q"
+        argv = calls[0]
+        assert " hello world --mention evil_bot " in argv  # 原样单元素
+        assert argv.count("--mention") == 0  # 注入的 flag 未成为独立参数
+
+    def test_env_template_with_text_no_extra_text_flag(self, monkeypatch, sender):
+        # 模板已含 {text} 时不再追加 --text(避免重复)
+        monkeypatch.setenv("SA_SEND_CMD", "send {bot} {chat_id} --text {text}")
+        calls = _patch_run(
+            monkeypatch,
+            lambda argv: FakeCompleted(stdout='{"message_id": "om_1"}'),
+        )
+        sender.send_top_level("oc_g", "hi there")
+        argv = calls[0]
+        assert argv.count("--text") == 1
+        assert "hi there" in argv
