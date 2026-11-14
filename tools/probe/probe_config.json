@@ -1,40 +1,40 @@
 {
-  "comment": "P0 第 1 项探针配置:评论事件接口 drive.notice.comment_add_v1。命令模板先按 lark-cli/botmux 已知文档形态填写,现场(P0)逐条校准后回填。占位符:{doc_token} {doc_url} {user_open_id} {listen_seconds} {out_dir}。",
+  "comment": "P0 第 1 项探针配置:评论事件接口 drive.notice.comment_add_v1。命令已于 2026-11-14 现场校准(见 docs/p0/2026-11-14-probe1-评论事件.md);结论 unavailable,事件转事件驱动需等 lark-cli 注册 drive EventKey。",
   "steps": [
     {
       "name": "create_doc",
-      "desc": "创建测试文档(以 user 身份)",
-      "argv": ["lark-cli", "docs", "+create", "--title", "P0探针-评论事件测试文档", "--as", "user"],
+      "desc": "创建测试文档(user 身份);doc_id 取 data.document.document_id",
+      "argv": ["lark-cli", "docs", "+create", "--title", "P0探针-评论事件测试文档-可删除", "--doc-format", "markdown", "--content", "# P0 探针测试文档\n\n用于验证 drive.notice.comment_add_v1 评论事件链路。测试完成后可删除。", "--as", "user"],
       "capture": "doc_token",
-      "capture_regex": "([A-Za-z0-9]{20,})"
+      "capture_regex": "\"document_id\"\\s*:\\s*\"([A-Za-z0-9]+)\""
     },
     {
       "name": "subscribe",
-      "desc": "订阅 drive.notice.comment_add_v1(POST /open-apis/drive/v1/user/subscription;经 lark-cli 原生 openapi 通道,现场校准具体子命令)",
-      "argv": ["lark-cli", "openapi", "post", "/open-apis/drive/v1/user/subscription", "--body", "{\"event_type\":\"drive.notice.comment_add_v1\"}"],
-      "assert": "返回 200 且不含 error"
+      "desc": "订阅 drive.notice.comment_add_v1(原生 openapi 透传;无列出/退订端点)",
+      "argv": ["lark-cli", "api", "POST", "/open-apis/drive/v1/user/subscription", "--data", "{\"event_type\":\"drive.notice.comment_add_v1\"}"],
+      "assert": "ok=true(订阅登记成功)"
     },
     {
       "name": "first_comment",
-      "desc": "以 user 身份在测试文档发首评(现场:手动或经 lark-cli drive +add-comment)",
-      "argv": ["lark-cli", "drive", "+add-comment", "--doc", "{doc_token}", "--content", "P0探针首评", "--as", "user"],
+      "desc": "以 user 身份发首评;content 必须是 [{type,text}] JSON,裸 token 需 --type docx",
+      "argv": ["lark-cli", "drive", "+add-comment", "--doc", "{doc_token}", "--type", "docx", "--content", "[{\"type\":\"text\",\"text\":\"P0探针首评:验证事件是否到达\"}]", "--as", "user"],
       "capture": "first_comment_id",
-      "capture_regex": "(com_[A-Za-z0-9]+)"
+      "capture_regex": "\"comment_id\"\\s*:\\s*\"?(\\d+)"
     },
     {
       "name": "second_reply",
-      "desc": "以 user 身份对首评二次回复",
-      "argv": ["lark-cli", "drive", "+reply-comment", "--doc", "{doc_token}", "--comment-id", "{first_comment_id}", "--content", "P0探针二次回复", "--as", "user"]
+      "desc": "以 user 身份对首评二次回复;注意 API 建档评论区默认禁回复(1069302),正式验证用真实任务文档",
+      "argv": ["lark-cli", "drive", "+add-reply", "--token", "{doc_token}", "--type", "docx", "--comment-id", "{first_comment_id}", "--content", "[{\"type\":\"text\",\"text\":\"P0探针二次回复:验证 reply 事件\"}]", "--as", "user"]
     },
     {
       "name": "listen",
-      "desc": "监听窗口:事件通道捕获(现场确认 lark-cli event consume 是否有对应 EventKey;无则用长连接/Webhook 抓包) NDJSON 落盘",
-      "argv": ["lark-cli", "event", "consume", "--timeout", "{listen_seconds}", "--out", "{out_dir}/events.ndjson"],
-      "assert": "events.ndjson 中出现可关联 {doc_token} 的 comment_add 事件(含首评与二次回复两条,且断线重连后重复事件可识别)"
+      "desc": "监听窗口(--timeout 带单位);2026-11-14 实测 unknown EventKey(lark-cli 1.0.97 无 drive 键)",
+      "argv": ["lark-cli", "event", "consume", "drive.notice.comment_add_v1", "--timeout", "{listen_seconds}s", "--as", "user"],
+      "assert": "stdout 收到可关联 {doc_token} 的 comment 事件(当前结果:unknown EventKey → unavailable)"
     }
   ],
   "conclusion_template": {
     "available": "事件可用:评论回路走事件为主 + 低频全量对账;comment_watcher 仅留作对账工具",
-    "unavailable": "事件不可用:启用 comment_watcher 轮询降级(分频+退避+配额评估,见 P0 第 8 项)"
+    "unavailable": "事件不可用:启用 comment_watcher 轮询降级(分频+退避+配额评估,见 P0 第 8 项)——2026-11-14 实测采纳此分支"
   }
 }
