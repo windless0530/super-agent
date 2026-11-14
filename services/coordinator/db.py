@@ -105,8 +105,12 @@ _DEFAULT_TASK_TYPES = [
 
 
 def connect(path: str) -> sqlite3.Connection:
-    """打开连接并设置 WAL 与外键;row_factory 用 sqlite3.Row。"""
-    conn = sqlite3.connect(path)
+    """打开连接并设置 WAL 与外键;row_factory 用 sqlite3.Row。
+
+    check_same_thread=False:HTTP 服务线程与推进线程共享连接,
+    串行化由调用方(cli.serve 的全局锁)保证——单写者原则。
+    """
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

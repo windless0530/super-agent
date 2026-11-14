@@ -1,0 +1,196 @@
+"""sa-coordinator CLI 与 HTTP 服务。
+
+用法:
+  python3 -m services.coordinator init-db          # 建库 + 类型种子
+  python3 -m services.coordinator serve [--port N] # 常驻 HTTP + 后台推进 outbox
+  python3 -m services.coordinator once             # 单次对账 + 推进(systemd timer 形态)
+"""
+
+import argparse
+import json
+import os
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+from . import db
+from .coordinator import Coordinator
+from .registry import TaskNotFound
+from .reconciler import reconcile
+from .report import InvalidReport
+from .sender import LarkCliSender
+
+DEFAULT_DB_PATH = "registry/tasks.db"
+POLL_INTERVAL_SECONDS = 5
+
+
+class LockHeld(Exception):
+    """单写者锁已被存活进程持有。"""
+
+
+def acquire_lock(lock_path: str) -> int:
+    """O_CREAT|O_EXCL 创建锁文件;已存在且 pid 存活则拒绝启动。"""
+    if os.path.exists(lock_path):
+        try:
+            with open(lock_path) as f:
+                old_pid = int(f.read().strip() or 0)
+            os.kill(old_pid, 0)  # 进程存活检查
+            raise LockHeld(f"coordinator 已在运行(pid={old_pid})")
+        except (ProcessLookupError, ValueError, PermissionError):
+            pass  # 残留锁:占用进程已死,接管
+    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644)
+    os.write(fd, str(os.getpid()).encode())
+    return fd
+
+
+def make_handler(co: Coordinator, lock: threading.Lock | None = None):
+    lock = lock or threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def _json(self, code: int, body: dict):
+            data = json.dumps(body, ensure_ascii=False).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):  # noqa: N802
+            parsed = urlparse(self.path)
+            if parsed.path == "/healthz":
+                self._json(200, {"ok": True})
+            elif parsed.path == "/tasks":
+                status = (parse_qs(parsed.query).get("status") or [None])[0]
+                with lock:
+                    tasks = [
+                        {"taskid": t.taskid, "status": t.status, "title": t.title,
+                         "phase": t.phase, "updated_at": t.updated_at}
+                        for t in _list_tasks(co, status)
+                    ]
+                self._json(200, {"tasks": tasks})
+            else:
+                self._json(404, {"error": "not found"})
+
+        def do_POST(self):  # noqa: N802
+            if urlparse(self.path).path != "/report":
+                self._json(404, {"error": "not found"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                event = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError as e:
+                self._json(422, {"error": f"非法 JSON: {e}"})
+                return
+            try:
+                with lock:
+                    body = co.handle_report(event)
+                self._json(200, body)
+            except InvalidReport as e:
+                self._json(422, {"error": str(e)})
+            except TaskNotFound as e:
+                self._json(422, {"error": f"任务不存在: {e}"})
+
+        def log_message(self, fmt, *args):  # 安静模式:交给 logging
+            pass
+
+    return Handler
+
+
+def _list_tasks(co: Coordinator, status: str | None):
+    if status:
+        rows = co.conn.execute(
+            "SELECT * FROM tasks WHERE status=? ORDER BY taskid", (status,)
+        ).fetchall()
+        from .registry import Task
+        return [Task.from_row(r) for r in rows]
+    from .registry import list_non_terminal
+    return list_non_terminal(co.conn)
+
+
+def serve_in_thread(co: Coordinator, port: int = 8787, ready=None):
+    """测试友好:线程内起服务,ready(port) 回调通知端口。"""
+    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(co))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    if ready:
+        ready(server.server_address[1])
+    # 返回可通过 join 停止的线程;server 随 daemon 退出
+    stopper = threading.Thread(target=server.shutdown, daemon=True)
+    stopper.start() if False else None  # 占位:shutdown 由测试进程退出兜底
+    return _Joinable(thread, server)
+
+
+class _Joinable:
+    def __init__(self, thread, server):
+        self._thread = thread
+        self._server = server
+
+    def join(self, timeout=None):
+        self._server.shutdown()
+        self._thread.join(timeout=timeout)
+
+
+def serve(host: str, port: int, db_path: str) -> None:
+    lock_fd = acquire_lock(os.path.join(os.path.dirname(db_path) or ".",
+                                        "coordinator.lock"))
+    conn = db.connect(db_path)
+    db.init_schema(conn)
+    db.seed_task_types(conn)
+    co = Coordinator(conn, LarkCliSender())
+
+    def poll():
+        import time
+        while True:
+            try:
+                with poll_lock:
+                    co.process_due_outbox()
+            except Exception:  # noqa: BLE001
+                import logging
+                logging.getLogger("coordinator").exception("outbox 推进异常(继续)")
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+    poll_lock = threading.Lock()
+    threading.Thread(target=poll, daemon=True).start()
+    print(f"sa-coordinator serving on {host}:{port} (db={db_path})", flush=True)
+    try:
+        ThreadingHTTPServer((host, port), make_handler(co, poll_lock)).serve_forever()
+    finally:
+        os.close(lock_fd)
+        os.unlink(os.path.join(os.path.dirname(db_path) or ".", "coordinator.lock"))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="services.coordinator")
+    parser.add_argument("--db", default=DEFAULT_DB_PATH)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init-db")
+    p_serve = sub.add_parser("serve")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8787)
+    sub.add_parser("once")
+    args = parser.parse_args(argv)
+
+    if args.cmd == "init-db":
+        conn = db.connect(args.db)
+        db.init_schema(conn)
+        db.seed_task_types(conn)
+        print(f"initialized {args.db}")
+    elif args.cmd == "serve":
+        serve(args.host, args.port, args.db)
+    elif args.cmd == "once":
+        conn = db.connect(args.db)
+        db.init_schema(conn)
+        db.seed_task_types(conn)
+        report = reconcile(conn, LarkCliSender(), now=__import__("services.coordinator.coordinator", fromlist=["utcnow_iso"]).utcnow_iso())
+        print(json.dumps({
+            "non_terminal": report.non_terminal,
+            "resent": report.resent,
+            "stuck": report.stuck,
+        }, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
