@@ -313,3 +313,62 @@ class TestReportGuards:
             from services.coordinator.registry import cas_update, get_task
             cas_update(conn, r.taskid, get_task(conn, r.taskid).version,
                        status="received")
+
+
+class TestAtomicity:
+    """C3:claim+CAS+enqueue 原子;崩溃后重发不丢报。"""
+
+    def _running(self, env):
+        conn, sender, probe, co = env
+        r = _ingest(co)
+        co.dispatch(r.taskid, seed_text="s", mentions=("design",))
+        co.process_due_outbox()
+        return co if False else r.taskid
+
+    def test_handle_report_rollback_on_mid_failure(self, env, monkeypatch):
+        conn, sender, probe, co = env
+        taskid = self._running(env)
+        # 入队阶段崩溃(模拟 kill -9 于事务内)
+        from services.coordinator import outbox as outbox_mod
+        real_enqueue = outbox_mod.enqueue
+
+        def boom(*a, **kw):
+            raise RuntimeError("kill -9")
+
+        monkeypatch.setattr(outbox_mod, "enqueue", boom)
+        with pytest.raises(RuntimeError):
+            co.handle_report({"event_id": "ev_r9", "taskid": taskid,
+                              "outcome": "completed", "phase": "p",
+                              "source_msg_id": "m", "doc_version": "1"})
+        monkeypatch.setattr(outbox_mod, "enqueue", real_enqueue)
+        # 事务回滚:无 inbox 残留、状态仍 running
+        assert conn.execute(
+            "SELECT COUNT(*) FROM inbox_events WHERE event_id='ev_r9'"
+        ).fetchone()[0] == 0
+        assert get_task(conn, taskid).status == "running"
+        # 同 event_id 重发(崩溃恢复)→ 正常受理,不吞
+        resp = co.handle_report({"event_id": "ev_r9", "taskid": taskid,
+                                 "outcome": "completed", "phase": "p",
+                                 "source_msg_id": "m", "doc_version": "1"})
+        assert resp["accepted"] is True
+
+    def test_unknown_taskid_leaves_no_claim_row(self, env):
+        conn, sender, probe, co = env
+        with pytest.raises(Exception):
+            co.handle_report({"event_id": "ev_bad", "taskid": "20261114-999",
+                              "outcome": "completed", "phase": "p",
+                              "source_msg_id": "m", "doc_version": "1"})
+        assert conn.execute(
+            "SELECT COUNT(*) FROM inbox_events WHERE event_id='ev_bad'"
+        ).fetchone()[0] == 0  # 422 路径不落 claim(改正 taskid 重发不被吞)
+
+    def test_orphan_ingest_returns_existing_task(self, env):
+        # 崩溃在 create_task 提交后、bind 之前:重投不得建第二个任务
+        conn, sender, probe, co = env
+        r = _ingest(co)
+        conn.execute("UPDATE inbox_events SET taskid=NULL WHERE event_id='ev_1'")
+        conn.commit()
+        r2 = _ingest(co)
+        assert r2.taskid == r.taskid  # 同一任务
+        n = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert n == 1

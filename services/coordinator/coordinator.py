@@ -84,7 +84,16 @@ class Coordinator:
         )
         if not claim.new and claim.prev_taskid:
             return IngestResult(taskid=claim.prev_taskid, new=False)
-        # 孤儿占位(claim 已入库但任务未建,崩溃恢复路径)也继续建任务
+        # 孤儿占位恢复(claim 已入库但 taskid 未回填):
+        # ① 任务其实已建(create 提交后、bind 前崩溃)→ 按 thread_a_msg_id 找回;
+        # ② 任务未建(claim 后、create 前崩溃)→ 继续建。
+        orphan = self.conn.execute(
+            "SELECT taskid FROM tasks WHERE thread_a_msg_id=?",
+            (thread_root_msg_id or message_id,),
+        ).fetchone()
+        if orphan is not None:
+            bind_taskid(self.conn, event_id, orphan[0])
+            return IngestResult(taskid=orphan[0], new=False)
         task = create_task(
             self.conn, type=task_type, title=title,
             message_id=message_id, event_id=event_id,
@@ -149,33 +158,43 @@ class Coordinator:
             self.conn, event_id=event["event_id"],
             message_id=f"report:{event['event_id']}",
             kind="report", payload={"outcome": event["outcome"]},
+            commit=False,
         )
         if not claim.new:
             return {"accepted": False, "duplicate": True}
-        rounds = (event.get("payload") or {}).get("rounds") or {}
-        merged = dict(task.rounds_by_phase)
-        for phase, n in rounds.items():
-            merged[phase] = n
-        task = cas_update(
-            self.conn, task.taskid, task.version,
-            status="report_pending",
-            phase=event["phase"],
-            rounds_by_phase=merged,
-        )
-        summary = (event.get("payload") or {}).get("summary") or task.title
-        doc_links = (event.get("payload") or {}).get("doc_links") or []
-        relay_text = f"任务 [{task.taskid}] {event['outcome']}: {summary}"
-        if doc_links:
-            relay_text += "\n" + "\n".join(doc_links)
-        outbox.enqueue(
-            self.conn, taskid=task.taskid, kind="relay",
-            payload={
-                "chat_id": task.thread_a_chat_id or "",
-                "root": task.thread_a_msg_id,
-                "text": relay_text,
-                "outcome": event["outcome"],
-            },
-        )
+        # 单事务:claim + CAS + 入队,失败整体回滚(C3)
+        try:
+            rounds = (event.get("payload") or {}).get("rounds") or {}
+            merged = dict(task.rounds_by_phase)
+            for phase, n in rounds.items():
+                merged[phase] = n
+            task = cas_update(
+                self.conn, task.taskid, task.version,
+                status="report_pending",
+                phase=event["phase"],
+                rounds_by_phase=merged,
+                commit=False,
+            )
+            summary = (event.get("payload") or {}).get("summary") or task.title
+            doc_links = (event.get("payload") or {}).get("doc_links") or []
+            relay_text = f"任务 [{task.taskid}] {event['outcome']}: {summary}"
+            if doc_links:
+                relay_text += "\n" + "\n".join(doc_links)
+            outbox.enqueue(
+                self.conn, taskid=task.taskid, kind="relay",
+                payload={
+                    "chat_id": task.thread_a_chat_id or "",
+                    "root": task.thread_a_msg_id,
+                    "text": relay_text,
+                    "outcome": event["outcome"],
+                    "report_event_id": event["event_id"],
+                },
+                commit=False,
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
         return {"accepted": True, "taskid": task.taskid, "status": "report_pending"}
 
     # ---------- 决策与澄清 ----------

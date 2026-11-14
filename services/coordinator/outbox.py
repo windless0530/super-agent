@@ -48,8 +48,11 @@ class OutboxRow:
         )
 
 
-def enqueue(conn: sqlite3.Connection, *, taskid: str, kind: str, payload: dict) -> int:
-    """入队一行待发消息(调用方负责与状态迁移同事务;此处显式提交)。"""
+def enqueue(
+    conn: sqlite3.Connection, *, taskid: str, kind: str, payload: dict,
+    commit: bool = True,
+) -> int:
+    """入队一行待发消息;commit=False 时并入调用方事务。"""
     if kind not in OUTBOX_KINDS:
         raise ValueError(f"未知 outbox kind: {kind}")
     now = _now()
@@ -58,7 +61,8 @@ def enqueue(conn: sqlite3.Connection, *, taskid: str, kind: str, payload: dict) 
         " VALUES (?,?,?,'pending',?,?)",
         (taskid, kind, json.dumps(payload, ensure_ascii=False), now, now),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.lastrowid
 
 

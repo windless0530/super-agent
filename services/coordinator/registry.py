@@ -163,6 +163,7 @@ def cas_update(
     expected_version: int,
     *,
     status: str | None = None,
+    commit: bool = True,
     **fields,
 ) -> Task:
     """CAS 更新:version 匹配才落库并 +1;status 变更先过状态机校验。"""
@@ -197,7 +198,8 @@ def cas_update(
     )
     if cur.rowcount == 0:
         raise StaleVersion(taskid, expected_version)
-    conn.commit()
+    if commit:
+        conn.commit()
     task = get_task(conn, taskid)
     assert task is not None
     return task

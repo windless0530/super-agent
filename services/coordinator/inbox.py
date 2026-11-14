@@ -24,11 +24,12 @@ def claim_event(
     message_id: str,
     kind: str,
     payload: dict,
+    commit: bool = True,
 ) -> ClaimResult:
     """尝试占位一个事件;event_id 或 message_id 任一重复即判定为重复事件。
 
-    注意:占位成功后调用方应在同一事务内完成后续写库并回填 taskid;
-    本函数不回滚——由调用方事务边界控制。
+    commit=False 时并入调用方事务(原子化路径);此时失败不回滚外层事务,
+    由调用方统一 commit/rollback。
     """
     now = datetime.now(timezone.utc).isoformat()
     try:
@@ -39,10 +40,12 @@ def claim_event(
             (event_id, message_id, kind, None,
              json.dumps(payload, ensure_ascii=False), now),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         return ClaimResult(new=True, taskid=None, prev_taskid=None)
     except sqlite3.IntegrityError:
-        conn.rollback()
+        if commit:
+            conn.rollback()
         prev = conn.execute(
             "SELECT taskid FROM inbox_events WHERE event_id=? OR message_id=?",
             (event_id, message_id),
