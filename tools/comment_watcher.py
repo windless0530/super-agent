@@ -26,11 +26,12 @@ from services.coordinator.registry import get_task  # noqa: E402
 logger = logging.getLogger("comment_watcher")
 
 DEFAULT_LIST_CMD = (
-    "lark-cli drive +list-comments --doc {doc_token} {page_token_arg}"
+    "lark-cli drive +list-comments --token {doc_token} --type docx "
+    "--solved-status all --need-reaction --as bot {page_token_arg}"
 )
 DEFAULT_GET_CMD = (
-    "lark-cli drive +get-comment --doc {doc_token} --comment-id {comment_id}"
-    " {page_token_arg}"
+    "lark-cli drive +list-replies --token {doc_token} --type docx "
+    "--comment-id {comment_id} --need-reaction --as bot {page_token_arg}"
 )
 
 
@@ -53,6 +54,58 @@ def _page_token_arg(page_token: str | None) -> str:
     return f"--page-token {shlex.quote(page_token)}" if page_token else ""
 
 
+def _content_text(content) -> str:
+    """Drive 实际返回 content.elements;统一成通知用的纯文本。"""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, dict):
+        return ""
+    texts = []
+    for element in content.get("elements", []):
+        if not isinstance(element, dict):
+            continue
+        text_run = element.get("text_run")
+        if isinstance(text_run, dict):
+            texts.append(str(text_run.get("text", "")))
+        elif element.get("type") == "text":
+            texts.append(str(element.get("text", "")))
+    return "".join(texts)
+
+
+def _normalize_reactions(reply: dict) -> list[dict]:
+    """聚合 reaction 展开成用户级记录;count=0 是删除残留,忽略。"""
+    out = []
+    for reaction in reply.get("reactions", []) or []:
+        if int(reaction.get("count", 0)) <= 0:
+            continue
+        for user_id in reaction.get("ahead_users", []) or []:
+            out.append({
+                "emoji_type": reaction.get("reaction_key", reaction.get("emoji_type")),
+                "user_id": user_id,
+                "reply_id": reply.get("reply_id"),
+            })
+    return out
+
+
+def _normalize_reply(reply: dict) -> dict:
+    out = dict(reply)
+    out["content"] = _content_text(reply.get("content"))
+    out["update_time"] = str(reply.get("update_time", ""))
+    return out
+
+
+def _normalize_comment(item: dict) -> dict:
+    """根回复即评论正文;提到 item 层,避免同步时根评论为空。"""
+    out = dict(item)
+    replies = (item.get("reply_list") or {}).get("replies", []) or []
+    root = replies[0] if replies else {}
+    out["content"] = _content_text(root.get("content", item.get("content", "")))
+    out["user_id"] = root.get("user_id", item.get("user_id", ""))
+    out["update_time"] = str(root.get("update_time", item.get("update_time", "")))
+    out["reactions"] = _normalize_reactions(root)
+    return out
+
+
 class LarkCliCommentReader:
     """经 lark-cli 读取评论;命令模板可用环境变量覆盖(P0 现场校准)。
 
@@ -69,20 +122,37 @@ class LarkCliCommentReader:
         return json.loads(proc.stdout)
 
     def list_comments(self, doc_token: str, page_token: str | None = None) -> dict:
-        return self._run(
+        raw = self._run(
             "SA_COMMENT_LIST_CMD", DEFAULT_LIST_CMD,
             doc_token=shlex.quote(doc_token),
             page_token_arg=_page_token_arg(page_token),
         )
+        data = raw.get("data", raw)
+        return {**raw, "data": {
+            **data, "items": [_normalize_comment(i) for i in data.get("items", [])]
+        }}
 
     def get_comment(self, doc_token: str, comment_id: str,
                     page_token: str | None = None) -> dict:
-        return self._run(
+        raw = self._run(
             "SA_COMMENT_GET_CMD", DEFAULT_GET_CMD,
             doc_token=shlex.quote(doc_token),
             comment_id=shlex.quote(comment_id),
             page_token_arg=_page_token_arg(page_token),
         )
+        data = raw.get("data", raw)
+        items = data.get("items", [])
+        # 只有第一页 items[0] 是根回复;根评论已由 list_comments 处理。
+        replies = items[1:] if page_token is None else items
+        reactions = []
+        for reply in items:
+            reactions.extend(_normalize_reactions(reply))
+        return {
+            "replies": [_normalize_reply(r) for r in replies],
+            "reactions": reactions,
+            "has_more": data.get("has_more", False),
+            "page_token": data.get("page_token"),
+        }
 
 
 def _seen(conn, key: tuple[str, str, str]) -> bool:
@@ -127,7 +197,7 @@ def _walk_comments(reader: CommentReader, doc_token: str):
         page = reader.list_comments(doc_token, page_token)
         data = page.get("data", page)
         for item in data.get("items", []):
-            replies, meta = _all_replies(reader, doc_token, item["comment_id"])
+            replies, meta = _all_replies(reader, doc_token, item)
             results.append((item, replies, meta))
         if not data.get("has_more"):
             break
@@ -137,9 +207,14 @@ def _walk_comments(reader: CommentReader, doc_token: str):
     return results
 
 
-def _all_replies(reader: CommentReader, doc_token: str, comment_id: str):
-    """展开单条评论的 reply_list 分页;返回 (replies, {is_solved, reactions})。"""
-    replies, meta = [], {"is_solved": None, "reactions": []}
+def _all_replies(reader: CommentReader, doc_token: str, item: dict):
+    """展开评论的 reply_list 分页;合并卡片与回复上的 reaction/is_solved。"""
+    comment_id = item["comment_id"]
+    replies = []
+    meta = {
+        "is_solved": item.get("is_solved"),
+        "reactions": list(item.get("reactions", []) or []),
+    }
     page_token = None
     while True:
         full = reader.get_comment(doc_token, comment_id, page_token)
@@ -195,9 +270,9 @@ def sync_doc(
             if str(reaction.get("user_id", "")) in bot_ids:
                 continue
             rkey = (*dedup_key(
-                comment_id,
+                reaction.get("reply_id") or comment_id,
                 f"{reaction.get('user_id')}:{reaction.get('emoji_type')}",
-                update_time), "reaction")
+                str(reaction.get("update_time", update_time))), "reaction")
             if not _seen(conn, rkey):
                 _record(conn, rkey, doc_token, taskid, reaction)
         # is_solved 单独记录

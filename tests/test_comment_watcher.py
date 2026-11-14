@@ -7,7 +7,7 @@ import pytest
 
 from services.coordinator import db
 from services.coordinator.coordinator import Coordinator
-from tools.comment_watcher import dedup_key, sync_doc
+from tools.comment_watcher import LarkCliCommentReader, dedup_key, sync_doc
 from tests.test_coordinator import FakeSender
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -235,3 +235,96 @@ class TestMainBotIds:
         docs = build_docs_fn(conn, bot_ids=("ou_bot_design", "ou_bot_review"))
         # 无带文档链接的非终态任务 → 空列表;函数可调用即契约成立
         assert docs() == []
+
+
+class TestLiveApiContract:
+    """P0 #8:lark-cli 1.0.97 的真实命令与 Drive 评论响应结构。"""
+
+    ROOT = {
+        "reply_id": "r_root", "user_id": "ou_elio", "update_time": 100,
+        "content": {"elements": [{"type": "text_run", "text_run": {"text": "根评论"}}]},
+        "reactions": [
+            {"reaction_key": "Get", "count": 1, "ahead_users": ["ou_bot_design"]},
+            {"reaction_key": "OK", "count": 1, "ahead_users": ["ou_elio"]},
+        ],
+    }
+    SECOND = {
+        "reply_id": "r_second", "user_id": "ou_elio", "update_time": 101,
+        "content": {"elements": [{"type": "text_run", "text_run": {"text": "二次回复"}}]},
+    }
+
+    @staticmethod
+    def _completed(payload):
+        return type("Completed", (), {
+            "returncode": 0, "stdout": json.dumps(payload), "stderr": "",
+        })()
+
+    def test_list_uses_real_command_and_normalizes_root(self, monkeypatch):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return self._completed({"ok": True, "data": {
+                "items": [{"comment_id": "c1", "user_id": "ou_elio",
+                           "is_solved": False, "reply_list": {"replies": [self.ROOT]}}],
+                "has_more": False, "page_token": "",
+            }})
+
+        monkeypatch.setattr("tools.comment_watcher.subprocess.run", run)
+        result = LarkCliCommentReader().list_comments("docx_real")
+        argv = calls[0]
+        assert "+list-comments" in argv and "--token" in argv
+        assert "--doc" not in argv and "--type" in argv and "docx" in argv
+        assert "--solved-status" in argv and "all" in argv
+        assert "--need-reaction" in argv
+        item = result["data"]["items"][0]
+        assert item["content"] == "根评论"
+        assert item["reactions"] == [
+            {"emoji_type": "Get", "user_id": "ou_bot_design", "reply_id": "r_root"},
+            {"emoji_type": "OK", "user_id": "ou_elio", "reply_id": "r_root"},
+        ]
+
+    def test_replies_use_real_command_and_skip_root_only_on_first_page(self, monkeypatch):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            page = argv[argv.index("--page-token") + 1] if "--page-token" in argv else None
+            items = [self.SECOND] if page else [self.ROOT, self.SECOND]
+            return self._completed({"ok": True, "data": {
+                "items": items, "has_more": False, "page_token": "",
+            }})
+
+        monkeypatch.setattr("tools.comment_watcher.subprocess.run", run)
+        reader = LarkCliCommentReader()
+        first = reader.get_comment("docx_real", "c1")
+        later = reader.get_comment("docx_real", "c1", "next")
+        assert "+list-replies" in calls[0] and "+get-comment" not in calls[0]
+        assert [r["content"] for r in first["replies"]] == ["二次回复"]
+        assert [r["content"] for r in later["replies"]] == ["二次回复"]
+        assert first["reactions"][1]["emoji_type"] == "OK"
+
+    def test_live_shape_notifies_root_once_and_records_reactions(self, monkeypatch, env):
+        conn, taskid = env
+
+        def run(argv, **kwargs):
+            if "+list-comments" in argv:
+                payload = {"data": {"items": [{
+                    "comment_id": "c1", "user_id": "ou_elio", "is_solved": False,
+                    "reply_list": {"replies": [self.ROOT]},
+                }], "has_more": False}}
+            else:
+                payload = {"data": {"items": [self.ROOT, self.SECOND], "has_more": False}}
+            return self._completed(payload)
+
+        monkeypatch.setattr("tools.comment_watcher.subprocess.run", run)
+        n = sync_doc(conn, LarkCliCommentReader(), doc_token="docx_real",
+                     taskid=taskid, bot_ids=BOT_IDS)
+        assert n == 2  # 根评论 + 二次回复;根回复不得再作为 reply 重复通知
+        texts = _notify_texts(conn)
+        assert texts == ["文档评论(ou_elio): 根评论", "评论回复(ou_elio): 二次回复"]
+        reactions = conn.execute(
+            "SELECT payload FROM comment_inbox WHERE kind='reaction'"
+        ).fetchall()
+        # bot 的 Get 被过滤,用户的 OK 被记录且不产生 notify。
+        assert [json.loads(r[0])["emoji_type"] for r in reactions] == ["OK"]
