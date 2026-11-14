@@ -68,10 +68,25 @@ def enqueue(
 
 def mark_sent(conn: sqlite3.Connection, outbox_id: int, sent_msg_id: str) -> None:
     conn.execute(
-        "UPDATE outbox SET status='sent', sent_msg_id=?, updated_at=? WHERE id=?",
+        "UPDATE outbox SET status='sent', sent_msg_id=?, needs_reconcile=0,"
+        " updated_at=? WHERE id=?",
         (sent_msg_id, _now(), outbox_id),
     )
     conn.commit()
+
+
+def mark_inflight(
+    conn: sqlite3.Connection, outbox_id: int, *, now: str, next_retry_at: str
+) -> bool:
+    """发送前原子认领;崩溃留下 needs_reconcile=1,重启不得盲发。"""
+    cur = conn.execute(
+        "UPDATE outbox SET needs_reconcile=1, next_retry_at=?, updated_at=?"
+        " WHERE id=? AND status='pending'"
+        " AND (next_retry_at IS NULL OR next_retry_at<=?)",
+        (next_retry_at, _now(), outbox_id, now),
+    )
+    conn.commit()
+    return cur.rowcount == 1
 
 
 def mark_failed_attempt(
@@ -80,11 +95,10 @@ def mark_failed_attempt(
     next_retry_at: str,
     needs_reconcile: bool = False,
 ) -> None:
-    """记一次失败:attempts+1,排下次重试;模糊失败置 needs_reconcile。"""
+    """记一次失败:attempts+1,排下次重试;明确失败可清除发送前对账标记。"""
     conn.execute(
         "UPDATE outbox SET attempts=attempts+1, next_retry_at=?,"
-        " needs_reconcile=CASE WHEN ? THEN 1 ELSE needs_reconcile END,"
-        " updated_at=? WHERE id=?",
+        " needs_reconcile=?, updated_at=? WHERE id=?",
         (next_retry_at, 1 if needs_reconcile else 0, _now(), outbox_id),
     )
     conn.commit()

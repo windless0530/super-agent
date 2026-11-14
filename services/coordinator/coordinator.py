@@ -286,6 +286,13 @@ class Coordinator:
                     self._post_send(row.kind, row.taskid, payload, found)
                     processed += 1
                     continue
+            # 外部调用前先持久化认领:若进程在发送后被 kill,重启看到的是
+            # needs_reconcile 行,必须先对账,不能把 attempts=0 当作从未尝试。
+            if not outbox.mark_inflight(
+                self.conn, row.id, now=now,
+                next_retry_at=_plus_seconds(now, RETRY_DELAY_SECONDS),
+            ):
+                continue  # 已被另一推进者认领
             try:
                 sent_msg_id = self._send(row.kind, payload)
             except AmbiguousSendError:
