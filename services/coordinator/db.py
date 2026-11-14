@@ -87,6 +87,11 @@ CREATE TABLE IF NOT EXISTS task_types (
     can_dev       INTEGER NOT NULL DEFAULT 0,
     enabled       INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE TABLE IF NOT EXISTS taskid_seq (
+    taskid_date TEXT PRIMARY KEY,
+    last        INTEGER NOT NULL
+);
 """
 
 # 默认类型注册表;group_chat_id 待 P0 实测建群后回填
