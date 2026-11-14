@@ -142,6 +142,42 @@ super-agent/
 | 7 | systemd unit + 容器重启演练:全部组件自动恢复,非终态任务续跑 | 无 systemd 镜像用云厂商保活 + entrypoint |
 | 8 | 评论降级与配额:完整分页、reply_list、二次回复、Get/OK reaction、is_solved、自回复过滤、轮询配额 | 漏检/自循环则停止自动回复;配额不足则分频 + 退避 |
 
+## 基础层(已实现)
+
+确定性脚本与角色 Skill 已落地并全部通过本地测试(103 项,`python3 -m pytest tests/ -q`),不依赖线上飞书环境:
+
+| 组件 | 位置 | 说明 |
+|-|-|-|
+| DB 层 | `services/coordinator/db.py` | 6 张表 + taskid_seq,连接 WAL/FK,幂等建库与类型种子(RD/RS/DEV) |
+| 状态机 | `services/coordinator/state.py` | received→clarifying/running→report_pending→done/awaiting_decision,done 唯一终态 |
+| 登记表 | `services/coordinator/registry.py` | taskid 分配(yyyymmdd-NNN,当日重置,并发唯一)、CAS 迁移(version 令牌) |
+| inbox | `services/coordinator/inbox.py` | event_id/message_id 双唯一约束,重复事件不重复建任务 |
+| outbox | `services/coordinator/outbox.py` | 持久化外发队列:pending/sent、退避重试、needs_reconcile |
+| sender | `services/coordinator/sender.py` | botmux/lark-cli 适配器;SendError(可重试)与 AmbiguousSendError(须对账)二分;命令模板环境变量可覆盖 |
+| 协调器 | `services/coordinator/coordinator.py` | ingest/dispatch/handle_report/relay_decision/clarify + process_due_outbox(重发前 probe 对账) |
+| HTTP/CLI | `services/coordinator/cli.py` + `reconciler.py` | `POST /report`、`GET /healthz`、`GET /tasks`;单写者锁;启动对账与卡死巡检(running 4h / report_pending 10min / awaiting_decision 24h) |
+| sactl | `tools/sactl` | worker 上报 CLI:event_id 生成一次复用、3 次退避重试、退出码 0/3/4 |
+| 评论 watcher | `tools/comment_watcher.py` | 轮询降级:分页展开、(reply_id+hash) 去重、bot 自回复过滤、reaction/is_solved 单独记录、活动/空闲分频 |
+| P0 探针 | `tools/probe/` | #1 评论事件探针(dry-run 可验证)+ 八项 runbook(`tools/probe/README.md`) |
+| Skill 验证器 | `tools/verify_skills.py` | 7 个 skill 结构校验 + sa-report↔report.py 契约交叉校验(防提示词与代码漂移) |
+| 角色 Skill | `skills/sa-*/SKILL.md` | 7 个:router/report/design/review/planner/executor/devreview |
+| 角色卡 | `bots/<role>/CLAUDE.md` | 6 张:身份+红线(与 Skill 分离) |
+
+常用命令:
+
+```bash
+python3 -m pytest tests/ -q                                  # 全量测试
+python3 tools/verify_skills.py                               # skill 结构+契约校验
+python3 -m services.coordinator --db registry/tasks.db init-db   # 建库
+python3 -m services.coordinator serve [--port 8787]          # 常驻 HTTP + 5s 推进 outbox
+python3 -m services.coordinator --db registry/tasks.db once  # 单次对账(systemd timer 形态)
+tools/sactl report --taskid <id> --outcome completed --phase <p> \
+  --source-msg-id <mid> --doc-version <v> [--payload-file p.json]
+python3 tools/probe/probe_comment_event.py --dry-run         # P0 探针 #1 演练
+```
+
+实施计划与逐任务记录:`docs/superpowers/plans/2026-11-14-foundation-skills-and-scripts.md`。
+
 ## 复用 / 自建边界
 
 **复用(零研发):** Claude Code / Codex(会话运行时)、botmux(IM↔CLI 桥、多 bot、话题会话、send/dispatch/report/schedule)、herdr(会话宿主,可随时 attach 附身观察)、lark-cli 全套 skills、superpowers 技能套系(角色 bot 内部流程纪律:brainstorming/writing-plans/TDD/code-review)。
