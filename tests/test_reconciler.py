@@ -64,3 +64,41 @@ def test_fresh_tasks_not_stuck(env):
     report = reconcile(conn, sender, now="2000-01-01T00:00:01")
     assert report.stuck == []
     assert report.non_terminal == 1
+
+
+class TestReviewFixes:
+    """I1:dispatch 已发出但 CAS 未落(崩溃窗口)的恢复;received/clarifying 卡死检出。"""
+
+    def test_sent_dispatch_row_backfills_cas(self, env):
+        conn, sender, co = env
+        r = co.ingest_task(event_id="ev_1", message_id="om_1", text="t",
+                           task_type="RD", title="A")
+        co.dispatch(r.taskid, seed_text="s", mentions=("design",))
+        # 模拟:发送成功 + mark_sent 已落库,随后崩溃,_post_send 未执行
+        from services.coordinator import outbox as om
+        oid = conn.execute("SELECT id FROM outbox").fetchone()[0]
+        om.mark_sent(conn, oid, sent_msg_id="om_seed_77")
+        # reconcile 后:补 CAS received→running + topic_root 写回
+        report = reconcile(conn, sender, now="2999-01-01T00:00:00")
+        from services.coordinator.registry import get_task
+        t = get_task(conn, r.taskid)
+        assert t.status == "running"
+        assert t.topic_root_msg_id == "om_seed_77"
+        assert t.active_role == "design"
+        assert report.resent == 0  # 不重发
+
+    def test_received_and_clarifying_stuck_detected(self, env):
+        conn, sender, co = env
+        r1 = co.ingest_task(event_id="ev_1", message_id="om_1", text="t",
+                            task_type="RD", title="A")
+        r2 = co.ingest_task(event_id="ev_2", message_id="om_2", text="t",
+                            task_type="RD", title="B")
+        co.set_clarifying(r2.taskid, "验收标准?")
+        conn.execute(
+            "UPDATE tasks SET updated_at='2000-01-01T00:00:00'"
+        )
+        conn.commit()
+        report = reconcile(conn, sender, now="2999-01-01T00:00:00")
+        stuck = {s["taskid"] for s in report.stuck}
+        assert r1.taskid in stuck  # received 超时
+        assert r2.taskid in stuck  # clarifying 超时
