@@ -177,7 +177,8 @@ def cas_update(
     # 陈旧版本优先报错:调用方视图过期时,先让其对账再谈迁移合法性
     if current["version"] != expected_version:
         raise StaleVersion(taskid, expected_version)
-    if status is not None and status != current["status"]:
+    if status is not None:
+        # status 语义 = 状态迁移;与当前相同也非法(仅改字段用 status=None)
         validate_transition(current["status"], status)
     sets, params = [], []
     for name, val in fields.items():

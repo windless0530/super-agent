@@ -132,6 +132,19 @@ class Coordinator:
 
     def handle_report(self, event: dict) -> dict:
         validate_report(event)
+        # 先校验任务存在与状态,再占位事件(C3 原子化的前置守卫):
+        # 非 running 的合法重复(已处理过的同 event_id)→ duplicate;
+        # 新 event_id 对非 running 任务 → 拒绝,杜绝 report_pending 期间重复回投(C1)
+        task = get_task(self.conn, event["taskid"])
+        if task is None:
+            raise TaskNotFound(event["taskid"])
+        if task.status != "running":
+            claimed = self.conn.execute(
+                "SELECT 1 FROM inbox_events WHERE event_id=?", (event["event_id"],)
+            ).fetchone()
+            if claimed:
+                return {"accepted": False, "duplicate": True}
+            return {"accepted": False, "reason": "not_running", "status": task.status}
         claim = claim_event(
             self.conn, event_id=event["event_id"],
             message_id=f"report:{event['event_id']}",
@@ -139,9 +152,6 @@ class Coordinator:
         )
         if not claim.new:
             return {"accepted": False, "duplicate": True}
-        task = get_task(self.conn, event["taskid"])
-        if task is None:
-            raise TaskNotFound(event["taskid"])
         rounds = (event.get("payload") or {}).get("rounds") or {}
         merged = dict(task.rounds_by_phase)
         for phase, n in rounds.items():

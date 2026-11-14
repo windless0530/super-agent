@@ -266,3 +266,50 @@ class TestDecisionAndClarify:
         t = get_task(conn, r.taskid)
         assert t.status == "running"
         assert t.decisions[-1]["text"] == "答复:重连成功率 > 99%"
+
+
+class TestReportGuards:
+    """C1:report_pending 期间新 event_id 的 report 不得重复回投。"""
+
+    def _running(self, env):
+        conn, sender, probe, co = env
+        r = _ingest(co)
+        co.dispatch(r.taskid, seed_text="s", mentions=("design",))
+        co.process_due_outbox()
+        return r.taskid
+
+    def test_new_event_report_while_pending_rejected(self, env):
+        conn, sender, probe, co = env
+        taskid = self._running(env)
+        co.handle_report({"event_id": "ev_r1", "taskid": taskid, "outcome": "completed",
+                          "phase": "p", "source_msg_id": "m", "doc_version": "1"})
+        # relay 尚未发出(report_pending),worker 用新 event_id 再报 → 拒绝
+        resp = co.handle_report({"event_id": "ev_r2", "taskid": taskid,
+                                 "outcome": "completed", "phase": "p",
+                                 "source_msg_id": "m", "doc_version": "1"})
+        assert resp["accepted"] is False
+        assert resp.get("reason") == "not_running"
+        # 推进后 thread A 只收到一次回投
+        co.process_due_outbox()
+        assert len([x for x in sender.replies if taskid in x["text"]]) == 1
+
+    def test_report_on_done_task_rejected(self, env):
+        conn, sender, probe, co = env
+        taskid = self._running(env)
+        co.handle_report({"event_id": "ev_r1", "taskid": taskid, "outcome": "completed",
+                          "phase": "p", "source_msg_id": "m", "doc_version": "1"})
+        co.process_due_outbox()
+        resp = co.handle_report({"event_id": "ev_rX", "taskid": taskid,
+                                 "outcome": "completed", "phase": "p",
+                                 "source_msg_id": "m", "doc_version": "1"})
+        assert resp["accepted"] is False
+
+    def test_cas_same_status_param_rejected(self, env):
+        # cas_update 显式传 status 与当前相同 → InvalidTransition(status 语义=迁移)
+        from services.coordinator.state import InvalidTransition
+        conn, sender, probe, co = env
+        r = _ingest(co)
+        with pytest.raises(InvalidTransition):
+            from services.coordinator.registry import cas_update, get_task
+            cas_update(conn, r.taskid, get_task(conn, r.taskid).version,
+                       status="received")
