@@ -156,3 +156,15 @@ def test_url_env_override(monkeypatch):
     )
     assert code == 0
     assert fake.requests[0]["url"] == "http://10.0.0.9:9999/report"
+
+
+def test_report_409_no_retry_exit3(monkeypatch):
+    # 409(任务非 running)是确定性拒绝:单次请求即返回,退出码 3
+    code, fake = _run(
+        monkeypatch,
+        [FakeResponse(409, {"accepted": False, "reason": "not_running"})],
+        ["--taskid", "t-1", "--outcome", "completed", "--phase", "p",
+         "--source-msg-id", "m", "--doc-version", "1"],
+    )
+    assert code == 3
+    assert len(fake.requests) == 1

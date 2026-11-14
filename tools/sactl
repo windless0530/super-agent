@@ -40,9 +40,9 @@ def _post(url: str, body: dict) -> tuple[int, dict]:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return resp.status, json.loads(resp.read() or b"{}")
         except urllib.error.HTTPError as e:
-            # 422 是确定性拒绝:不重试
-            if e.code == 422:
-                return 422, json.loads(e.read() or b"{}")
+            # 422/409 是确定性拒绝(报文不合法/任务非 running):不重试
+            if e.code in (422, 409):
+                return e.code, json.loads(e.read() or b"{}")
             last_exc = e
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             last_exc = e
@@ -76,8 +76,8 @@ def cmd_report(args) -> int:
     except Exception as e:  # noqa: BLE001
         print(f"sactl: 不可达 {url}: {e}", file=sys.stderr)
         return 4
-    if status == 422:
-        print(f"sactl: 被拒绝: {body.get('error')}", file=sys.stderr)
+    if status in (422, 409):
+        print(f"sactl: 被拒绝: {body.get('error') or body.get('reason')}", file=sys.stderr)
         return 3
     print(json.dumps(body, ensure_ascii=False))
     return 0

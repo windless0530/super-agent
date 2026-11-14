@@ -46,6 +46,14 @@ class IngestResult:
     new: bool
 
 
+class ReportRejected(Exception):
+    """report 被确定性拒绝(如任务非 running);body 携带原因。"""
+
+    def __init__(self, body: dict):
+        self.body = body
+        super().__init__(str(body))
+
+
 @runtime_checkable
 class MsgProbe(Protocol):
     def find_seed(self, group_chat_id: str, taskid: str) -> str | None: ...
@@ -153,7 +161,9 @@ class Coordinator:
             ).fetchone()
             if claimed:
                 return {"accepted": False, "duplicate": True}
-            return {"accepted": False, "reason": "not_running", "status": task.status}
+            raise ReportRejected(
+                {"accepted": False, "reason": "not_running", "status": task.status}
+            )
         claim = claim_event(
             self.conn, event_id=event["event_id"],
             message_id=f"report:{event['event_id']}",

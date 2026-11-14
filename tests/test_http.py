@@ -48,8 +48,11 @@ def _post(url, path, body):
 
 
 def _get(url, path):
-    with urllib.request.urlopen(url + path, timeout=5) as resp:
-        return resp.status, json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(url + path, timeout=5) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
 
 
 def test_healthz(server):
@@ -107,3 +110,48 @@ def test_single_writer_lock(tmp_path):
     assert acquire_lock(str(lock)) is not None
     with pytest.raises(LockHeld):
         acquire_lock(str(lock))
+
+
+class TestReviewFixes:
+    """I7:非 running 拒绝=409;服务端异常=500 JSON,不再裸断连接。"""
+
+    def test_not_running_report_maps_409(self, server):
+        url, taskid = server
+        # 先把任务推到 report_pending
+        _post(url, "/report", {
+            "event_id": "ev_r1", "taskid": taskid, "outcome": "completed",
+            "phase": "p", "source_msg_id": "m", "doc_version": "1"})
+        status, body = _post(url, "/report", {
+            "event_id": "ev_r2", "taskid": taskid, "outcome": "completed",
+            "phase": "p", "source_msg_id": "m", "doc_version": "1"})
+        assert status == 409
+        assert body["reason"] == "not_running"
+
+    def test_unknown_path_404_json(self, server):
+        url, _ = server
+        status, body = _get(url, "/nope")
+        assert status == 404 and body == {"error": "not found"}
+
+    def test_internal_error_500(self, tmp_path, monkeypatch):
+        import threading
+        from services.coordinator import cli as cli_mod
+        from services.coordinator.coordinator import Coordinator
+        from tests.test_coordinator import FakeSender
+        conn = db.connect(str(tmp_path / "t.db"))
+        db.init_schema(conn)
+        db.seed_task_types(conn)
+        co = Coordinator(conn, FakeSender())
+
+        def boom(event):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(co, "handle_report", boom)
+        holder = {}
+        th = cli_mod.serve_in_thread(co, port=0, ready=lambda p: holder.__setitem__("p", p))
+        try:
+            status, body = _post(f"http://127.0.0.1:{holder['p']}", "/report",
+                                 {"any": "thing"})
+            assert status == 500
+            assert "error" in body
+        finally:
+            th.join(timeout=5)

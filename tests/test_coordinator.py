@@ -279,30 +279,32 @@ class TestReportGuards:
         return r.taskid
 
     def test_new_event_report_while_pending_rejected(self, env):
+        from services.coordinator.coordinator import ReportRejected
         conn, sender, probe, co = env
         taskid = self._running(env)
         co.handle_report({"event_id": "ev_r1", "taskid": taskid, "outcome": "completed",
                           "phase": "p", "source_msg_id": "m", "doc_version": "1"})
         # relay 尚未发出(report_pending),worker 用新 event_id 再报 → 拒绝
-        resp = co.handle_report({"event_id": "ev_r2", "taskid": taskid,
-                                 "outcome": "completed", "phase": "p",
-                                 "source_msg_id": "m", "doc_version": "1"})
-        assert resp["accepted"] is False
-        assert resp.get("reason") == "not_running"
+        with pytest.raises(ReportRejected) as ei:
+            co.handle_report({"event_id": "ev_r2", "taskid": taskid,
+                              "outcome": "completed", "phase": "p",
+                              "source_msg_id": "m", "doc_version": "1"})
+        assert ei.value.body["reason"] == "not_running"
         # 推进后 thread A 只收到一次回投
         co.process_due_outbox()
         assert len([x for x in sender.replies if taskid in x["text"]]) == 1
 
     def test_report_on_done_task_rejected(self, env):
+        from services.coordinator.coordinator import ReportRejected
         conn, sender, probe, co = env
         taskid = self._running(env)
         co.handle_report({"event_id": "ev_r1", "taskid": taskid, "outcome": "completed",
                           "phase": "p", "source_msg_id": "m", "doc_version": "1"})
         co.process_due_outbox()
-        resp = co.handle_report({"event_id": "ev_rX", "taskid": taskid,
-                                 "outcome": "completed", "phase": "p",
-                                 "source_msg_id": "m", "doc_version": "1"})
-        assert resp["accepted"] is False
+        with pytest.raises(ReportRejected):
+            co.handle_report({"event_id": "ev_rX", "taskid": taskid,
+                              "outcome": "completed", "phase": "p",
+                              "source_msg_id": "m", "doc_version": "1"})
 
     def test_cas_same_status_param_rejected(self, env):
         # cas_update 显式传 status 与当前相同 → InvalidTransition(status 语义=迁移)

@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from . import db
-from .coordinator import Coordinator
+from .coordinator import Coordinator, ReportRejected, utcnow_iso
 from .registry import TaskNotFound
 from .reconciler import reconcile
 from .report import InvalidReport
@@ -91,6 +91,12 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
                 self._json(422, {"error": str(e)})
             except TaskNotFound as e:
                 self._json(422, {"error": f"任务不存在: {e}"})
+            except ReportRejected as e:
+                self._json(409, e.body)
+            except Exception as e:  # noqa: BLE001 — 兜底:服务端 bug 不得伪装成断连
+                import logging
+                logging.getLogger("coordinator").exception("handle_report 内部错误")
+                self._json(500, {"error": f"内部错误: {e}"})
 
         def log_message(self, fmt, *args):  # 安静模式:交给 logging
             pass
