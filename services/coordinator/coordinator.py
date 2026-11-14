@@ -213,6 +213,13 @@ class Coordinator:
         task = get_task(self.conn, taskid)
         if task is None:
             raise TaskNotFound(taskid)
+        if task.status != "awaiting_decision":
+            # 拍板只对 awaiting_decision 生效;report_pending 期提前拍板
+            # 会借道 report_pending→running 产生半程迁移,必须拒绝
+            raise ReportRejected(
+                {"accepted": False, "reason": "not_awaiting_decision",
+                 "status": task.status}
+            )
         task = cas_update(self.conn, taskid, task.version, status="running")
         task = cas_update(
             self.conn, taskid, task.version, decisions=list(task.decisions) + [{"text": decision_text}]

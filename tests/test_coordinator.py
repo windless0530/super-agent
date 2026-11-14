@@ -409,3 +409,22 @@ class TestReconcileSafety:
         co_later = Coordinator(conn, sender, now=lambda: "2999-01-01T00:00:00", probe=probe)
         assert co_later.process_due_outbox() == 1
         assert get_task(conn, r.taskid).status == "running"
+
+
+class TestDecisionGuard:
+    """演示发现:relay_decision 仅允许 awaiting_decision,不得借道 report_pending→running。"""
+
+    def test_relay_decision_rejects_when_not_awaiting(self, env):
+        from services.coordinator.coordinator import ReportRejected
+        conn, sender, probe, co = env
+        r = _ingest(co)
+        co.dispatch(r.taskid, seed_text="s", mentions=("design",))
+        co.process_due_outbox()
+        # report_pending(relay 未发)时拍板 → 拒绝,不产生半程迁移
+        co.handle_report({"event_id": "ev_r1", "taskid": r.taskid,
+                          "outcome": "escalated", "phase": "p",
+                          "source_msg_id": "m", "doc_version": "1"})
+        with pytest.raises(ReportRejected):
+            co.relay_decision(r.taskid, "拍板:某方案")
+        assert get_task(conn, r.taskid).status == "report_pending"
+        assert conn.execute("SELECT COUNT(*) FROM outbox WHERE kind='decision'").fetchone()[0] == 0
