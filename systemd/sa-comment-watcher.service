@@ -1,0 +1,19 @@
+[Unit]
+Description=Super-agent document comment polling fallback
+After=network-online.target sa-coordinator.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/workspace/super-agent
+Environment=PYTHONUNBUFFERED=1
+# 必须配置 SA_WATCHER_BOT_ID_ARGS，例如：
+# SA_WATCHER_BOT_ID_ARGS=--bot-id ou_xxx --bot-id ou_yyy
+EnvironmentFile=/home/ubuntu/.config/super-agent/watcher.env
+ExecStart=/usr/bin/python3 tools/comment_watcher.py --db registry/tasks.db $SA_WATCHER_BOT_ID_ARGS
+Restart=always
+RestartSec=5s
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=default.target
