@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""sactl:worker 角色.bot 与 sa-coordinator 的唯一上报通道。
+
+子命令:
+  report  提交完成/升级事件(POST /report)
+  task    查看任务(show)
+
+退出码:0 = accepted 或 duplicate;3 = 服务端拒绝(422);4 = 不可达。
+幂等:event_id 每次调用生成一次,跨重试复用;服务端按 event_id 去重。
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+DEFAULT_URL = "http://127.0.0.1:8787"
+RETRIES = 3
+BACKOFF = (1, 2, 4)
+
+
+def _base_url(args_url: str | None) -> str:
+    return (args_url or os.environ.get("SA_COORDINATOR_URL") or DEFAULT_URL).rstrip("/")
+
+
+def _post(url: str, body: dict) -> tuple[int, dict]:
+    """带重试的 POST;返回 (http_status, body)。重试耗尽抛最后异常。"""
+    last_exc = None
+    for attempt in range(RETRIES):
+        try:
+            req = urllib.request.Request(
+                url, data=json.dumps(body, ensure_ascii=False).encode(),
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            # 422 是确定性拒绝:不重试
+            if e.code == 422:
+                return 422, json.loads(e.read() or b"{}")
+            last_exc = e
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            last_exc = e
+        if attempt < RETRIES - 1:
+            time.sleep(BACKOFF[attempt])
+    raise last_exc
+
+
+def _get(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        return json.loads(resp.read() or b"{}")
+
+
+def cmd_report(args) -> int:
+    payload = {}
+    if args.payload_file:
+        with open(args.payload_file, encoding="utf-8") as f:
+            payload = json.load(f)
+    event = {
+        "event_id": str(uuid.uuid4()),  # 生成一次,重试复用
+        "taskid": args.taskid,
+        "outcome": args.outcome,
+        "phase": args.phase,
+        "source_msg_id": args.source_msg_id,
+        "doc_version": args.doc_version,
+        "payload": payload,
+    }
+    url = _base_url(args.url) + "/report"
+    try:
+        status, body = _post(url, event)
+    except Exception as e:  # noqa: BLE001
+        print(f"sactl: 不可达 {url}: {e}", file=sys.stderr)
+        return 4
+    if status == 422:
+        print(f"sactl: 被拒绝: {body.get('error')}", file=sys.stderr)
+        return 3
+    print(json.dumps(body, ensure_ascii=False))
+    return 0
+
+
+def cmd_task(args) -> int:
+    url = _base_url(args.url) + f"/tasks?taskid={args.taskid}"
+    try:
+        body = _get(url)
+    except Exception as e:  # noqa: BLE001
+        print(f"sactl: 不可达 {url}: {e}", file=sys.stderr)
+        return 4
+    print(json.dumps(body, ensure_ascii=False, indent=2))
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="sactl", description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("report", help="提交完成/升级事件")
+    p.add_argument("--taskid", required=True)
+    p.add_argument("--outcome", required=True, choices=["completed", "escalated"])
+    p.add_argument("--phase", required=True)
+    p.add_argument("--source-msg-id", required=True)
+    p.add_argument("--doc-version", required=True)
+    p.add_argument("--payload-file", help="JSON 文件(分歧卡片/摘要/文档链接)")
+    p.add_argument("--url", help="coordinator 地址(默认环境变量 SA_COORDINATOR_URL)")
+    p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("task", help="查看任务")
+    p.add_argument("action", choices=["show"])
+    p.add_argument("taskid_arg", metavar="taskid")
+    p.add_argument("--url")
+    p.set_defaults(func=cmd_task)
+
+    args = parser.parse_args(argv)
+    if args.cmd == "task":
+        args.taskid = args.taskid_arg
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
