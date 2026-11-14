@@ -28,7 +28,7 @@ class FakeReader:
     def list_comments(self, doc_token, page_token=None):
         return self.pages.get(page_token or "", {"data": {"items": [], "has_more": False}})
 
-    def get_comment(self, doc_token, comment_id):
+    def get_comment(self, doc_token, comment_id, page_token=None):
         if comment_id == "com_1":
             return {
                 "replies": [
@@ -104,7 +104,7 @@ def test_content_update_generates_new_record(env):
     reader = FakeReader()
     sync_doc(conn, reader, doc_token="docx_1", taskid=taskid, bot_ids=BOT_IDS)
     # 用户编辑了二次回复(update_time 与内容都变)
-    reader.get_comment = lambda doc, cid: {
+    reader.get_comment = lambda doc, cid, page_token=None: {
         "replies": [
             {"reply_id": "rep_1", "user_id": "ou_bot_design",
              "content": "收到,已补充", "update_time": "2026-11-14T01:00:00"},
@@ -155,3 +155,55 @@ def test_watch_loop_single_round_smoke(env):
     watch_loop(conn, reader, docs, active_interval=0, idle_interval=0,
                stop=stop, max_rounds=lambda: next(rounds, 0))
     assert len(_notify_texts(conn)) == 3
+
+
+class TestPagination:
+    """I2:list 分页游标必须传给 reader;reply_list 分页必须展开。"""
+
+    def test_list_pagination_cursor_forwarded(self, env):
+        conn, taskid = env
+        seen_tokens = []
+
+        class PagedReader(FakeReader):
+            def list_comments(self, doc_token, page_token=None):
+                seen_tokens.append(page_token)
+                return self.pages.get(page_token or "",
+                                      {"data": {"items": [], "has_more": False}})
+
+        reader = PagedReader()
+        sync_doc(conn, reader, doc_token="docx_1", taskid=taskid, bot_ids=BOT_IDS)
+        # 第一页(page_token=None)→ 第二页(cp1)→ 终止,不死循环
+        assert seen_tokens == [None, "cp1"]
+        # 两页的评论都进 notify
+        texts = _notify_texts(conn)
+        assert any("这里要补充超时分析" in t for t in texts)   # page1
+        assert any("总体方向 Get" in t for t in texts)          # page2
+
+    def test_reply_pagination_expanded(self, env):
+        conn, taskid = env
+        calls = []
+
+        class ReplyPagedReader(FakeReader):
+            def get_comment(self, doc_token, comment_id, page_token=None):
+                calls.append((comment_id, page_token))
+                if comment_id == "com_1":
+                    if page_token is None:
+                        return {"replies": [
+                            {"reply_id": "rep_1", "user_id": "ou_bot_design",
+                             "content": "收到", "update_time": "t1"},
+                            {"reply_id": "rep_2", "user_id": "ou_elio",
+                             "content": "第一页用户回复", "update_time": "t2"},
+                        ], "has_more": True, "page_token": "rp1"}
+                    return {"replies": [
+                        {"reply_id": "rep_3", "user_id": "ou_elio",
+                         "content": "第二页用户回复", "update_time": "t3"},
+                    ], "has_more": False}
+                return {"replies": [], "is_solved": True, "reactions": []}
+
+        sync_doc(conn, ReplyPagedReader(), doc_token="docx_1",
+                 taskid=taskid, bot_ids=BOT_IDS)
+        # com_1 的 reply 分页被展开(两页都取)
+        assert ("com_1", None) in calls and ("com_1", "rp1") in calls
+        texts = _notify_texts(conn)
+        assert any("第一页用户回复" in t for t in texts)
+        assert any("第二页用户回复" in t for t in texts)  # 第 2 页不再漏检

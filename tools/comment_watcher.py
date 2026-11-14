@@ -25,8 +25,13 @@ from services.coordinator.registry import get_task  # noqa: E402
 
 logger = logging.getLogger("comment_watcher")
 
-DEFAULT_LIST_CMD = "lark-cli drive +list-comments --doc {doc_token}"
-DEFAULT_GET_CMD = "lark-cli drive +get-comment --doc {doc_token} --comment-id {comment_id}"
+DEFAULT_LIST_CMD = (
+    "lark-cli drive +list-comments --doc {doc_token} {page_token_arg}"
+)
+DEFAULT_GET_CMD = (
+    "lark-cli drive +get-comment --doc {doc_token} --comment-id {comment_id}"
+    " {page_token_arg}"
+)
 
 
 def dedup_key(reply_id: str, content: str, update_time: str) -> tuple[str, str]:
@@ -37,32 +42,46 @@ def dedup_key(reply_id: str, content: str, update_time: str) -> tuple[str, str]:
 
 @runtime_checkable
 class CommentReader(Protocol):
-    def list_comments(self, doc_token: str, page_token: str | None) -> dict: ...
+    def list_comments(self, doc_token: str, page_token: str | None = None) -> dict: ...
 
-    def get_comment(self, doc_token: str, comment_id: str) -> dict: ...
+    def get_comment(self, doc_token: str, comment_id: str,
+                    page_token: str | None = None) -> dict: ...
+
+
+def _page_token_arg(page_token: str | None) -> str:
+    """渲染为 `--page-token xxx` 或空串(空串元素稍后过滤)。"""
+    return f"--page-token {shlex.quote(page_token)}" if page_token else ""
 
 
 class LarkCliCommentReader:
-    """经 lark-cli 读取评论;命令模板可用环境变量覆盖(P0 现场校准)。"""
+    """经 lark-cli 读取评论;命令模板可用环境变量覆盖(P0 现场校准)。
+
+    分页:list/get 均带 {page_token_arg} 占位,渲染为 --page-token <t>
+    或空;调用方按返回的 has_more/page_token 逐页展开。
+    """
 
     def _run(self, template_env: str, default: str, **kw) -> dict:
         template = os.environ.get(template_env, default)
-        argv = shlex.split(template.format(**{k: shlex.quote(v) for k, v in kw.items()}))
+        argv = [a for a in shlex.split(template.format(**kw)) if a]
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
         if proc.returncode != 0:
             raise RuntimeError(f"评论读取失败: {proc.stderr[:200]}")
         return json.loads(proc.stdout)
 
-    def list_comments(self, doc_token: str, page_token: str | None) -> dict:
-        page = self._run(
-            "SA_COMMENT_LIST_CMD", DEFAULT_LIST_CMD, doc_token=doc_token
+    def list_comments(self, doc_token: str, page_token: str | None = None) -> dict:
+        return self._run(
+            "SA_COMMENT_LIST_CMD", DEFAULT_LIST_CMD,
+            doc_token=shlex.quote(doc_token),
+            page_token_arg=_page_token_arg(page_token),
         )
-        return page if page_token is None else page  # 分页游标由调用方展开
 
-    def get_comment(self, doc_token: str, comment_id: str) -> dict:
+    def get_comment(self, doc_token: str, comment_id: str,
+                    page_token: str | None = None) -> dict:
         return self._run(
             "SA_COMMENT_GET_CMD", DEFAULT_GET_CMD,
-            doc_token=doc_token, comment_id=comment_id,
+            doc_token=shlex.quote(doc_token),
+            comment_id=shlex.quote(comment_id),
+            page_token_arg=_page_token_arg(page_token),
         )
 
 
@@ -101,21 +120,39 @@ def _emit_notify(conn, taskid: str, text: str) -> None:
 
 
 def _walk_comments(reader: CommentReader, doc_token: str):
-    """展开评论分页;返回 [(comment, full_comment_dict)]。"""
+    """展开评论分页与每条评论的 reply 分页;返回 [(comment, replies, meta)]。"""
     results = []
     page_token = None
     while True:
         page = reader.list_comments(doc_token, page_token)
         data = page.get("data", page)
         for item in data.get("items", []):
-            full = reader.get_comment(doc_token, item["comment_id"])
-            results.append((item, full))
+            replies, meta = _all_replies(reader, doc_token, item["comment_id"])
+            results.append((item, replies, meta))
         if not data.get("has_more"):
             break
         page_token = data.get("page_token")
         if not page_token:
             break
     return results
+
+
+def _all_replies(reader: CommentReader, doc_token: str, comment_id: str):
+    """展开单条评论的 reply_list 分页;返回 (replies, {is_solved, reactions})。"""
+    replies, meta = [], {"is_solved": None, "reactions": []}
+    page_token = None
+    while True:
+        full = reader.get_comment(doc_token, comment_id, page_token)
+        replies.extend(full.get("replies", []))
+        if meta["is_solved"] is None:
+            meta["is_solved"] = full.get("is_solved")
+        meta["reactions"].extend(full.get("reactions", []) or [])
+        if not full.get("has_more"):
+            break
+        page_token = full.get("page_token")
+        if not page_token:
+            break
+    return replies, meta
 
 
 def sync_doc(
@@ -128,7 +165,7 @@ def sync_doc(
 ) -> int:
     """同步一篇文档的评论;返回新增 notify 条数(去重后用户侧新内容)。"""
     notified = 0
-    for item, full in _walk_comments(reader, doc_token):
+    for item, replies, meta in _walk_comments(reader, doc_token):
         comment_id = item["comment_id"]
         author = item.get("user_id", "")
         content = item.get("content", "")
@@ -141,8 +178,8 @@ def sync_doc(
                         {"user_id": author, "content": content})
                 _emit_notify(conn, taskid, f"文档评论({author}): {content}")
                 notified += 1
-        # 回复分页(过滤 bot 自回复,防死循环)
-        for reply in full.get("replies", []):
+        # 回复(完整分页展开;过滤 bot 自回复,防死循环)
+        for reply in replies:
             if reply.get("user_id", "") in bot_ids:
                 continue
             key = (*dedup_key(reply["reply_id"], reply.get("content", ""),
@@ -154,7 +191,7 @@ def sync_doc(
                              f"评论回复({reply.get('user_id')}): {reply.get('content')}")
                 notified += 1
         # reaction 单独记录,不产生 notify
-        for reaction in full.get("reactions", []):
+        for reaction in meta.get("reactions", []):
             if str(reaction.get("user_id", "")) in bot_ids:
                 continue
             rkey = (*dedup_key(
@@ -164,7 +201,7 @@ def sync_doc(
             if not _seen(conn, rkey):
                 _record(conn, rkey, doc_token, taskid, reaction)
         # is_solved 单独记录
-        solved = full.get("is_solved")
+        solved = meta.get("is_solved")
         if solved is not None:
             skey = (*dedup_key(comment_id, str(solved), update_time), "solved")
             if not _seen(conn, skey):
