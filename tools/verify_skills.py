@@ -17,10 +17,15 @@ from services.coordinator.report import OUTCOMES, REPORT_FIELDS  # noqa: E402
 
 DESCRIPTION_LIMIT = 200
 
-# REQUIRED_TOKENS:Task 12 启用 sa-router/sa-report;其余角色 Task 13 解锁
+# REQUIRED_TOKENS:全部 7 个角色 skill 的协议要素(T13 解锁后终版)
 REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
     "sa-router": ("澄清", "类型注册表", "结构化", "禁止", "Get"),
     "sa-report": ("sactl report", "completed", "escalated", "event_id", "幂等", "三轮"),
+    "sa-design": ("认领消息", "进展楼", "方案模板", "@评审", "三轮", "sactl report"),
+    "sa-review": ("检查单", "可行性", "风险", "与原任务偏差", "三轮", "sactl report"),
+    "sa-planner": ("Spec", "方案文档", "@开发评审", "@Executor", "sactl report"),
+    "sa-executor": ("worktree", "自测", "自测报告", "@开发评审", "sactl report"),
+    "sa-devreview": ("Spec", "diff", "自动修复", "小修", "大改", "sactl report"),
 }
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)

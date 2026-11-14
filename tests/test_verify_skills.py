@@ -85,6 +85,19 @@ def test_contract_cross_check_report_fields(tmp_path):
 def test_real_skills_all_pass():
     errors = verify_skills.check_tree(REPO / "skills", required=verify_skills.REQUIRED_TOKENS)
     assert errors == [], f"真实 skills 校验失败: {errors}"
+    # Task 13 后:全部 7 个 skill 均已注册且通过
+    assert set(verify_skills.REQUIRED_TOKENS) == {
+        "sa-router", "sa-report", "sa-design", "sa-review",
+        "sa-planner", "sa-executor", "sa-devreview",
+    }
+
+
+def test_role_cards_exist():
+    for role in ("router", "design", "reviewer", "planner", "executor", "devreviewer"):
+        card = REPO / "bots" / role / "CLAUDE.md"
+        assert card.exists(), f"缺角色卡: {card}"
+        text = card.read_text(encoding="utf-8")
+        assert "禁止" in text and "三轮" in text  # 身份 + 红线齐全
 
 
 def test_cli_exit_code():
