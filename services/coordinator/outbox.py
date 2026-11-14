@@ -90,6 +90,15 @@ def mark_failed_attempt(
     conn.commit()
 
 
+def defer(conn: sqlite3.Connection, outbox_id: int, next_retry_at: str) -> None:
+    """推迟一行(attempts 不变):用于无 probe 时的安全滞留。"""
+    conn.execute(
+        "UPDATE outbox SET next_retry_at=?, updated_at=? WHERE id=?",
+        (next_retry_at, _now(), outbox_id),
+    )
+    conn.commit()
+
+
 def pending_due(conn: sqlite3.Connection, now: str) -> list[OutboxRow]:
     """status=pending 且(无重试时间或已到点)的行,按 id 升序。"""
     rows = conn.execute(

@@ -253,7 +253,16 @@ class Coordinator:
             must_reconcile = row.needs_reconcile or (
                 row.kind == "dispatch" and row.attempts > 0
             )
-            if must_reconcile and self.probe is not None:
+            if must_reconcile:
+                if self.probe is None:
+                    # 不变式:无对账手段就不重发(宁可滞留,不可重复话题/回投)
+                    logger.error(
+                        "outbox 行 %s(task=%s)needs_reconcile 且无 probe,跳过重发,"
+                        "待 probe 注入或人工处置", row.id, row.taskid,
+                    )
+                    outbox.defer(self.conn, row.id,
+                                 next_retry_at=_plus_seconds(now, RETRY_DELAY_SECONDS))
+                    continue
                 found = self.probe.find_seed(payload.get("chat_id", ""), row.taskid)
                 if found:
                     outbox.mark_sent(self.conn, row.id, found)

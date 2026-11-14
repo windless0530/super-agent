@@ -372,3 +372,38 @@ class TestAtomicity:
         assert r2.taskid == r.taskid  # 同一任务
         n = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         assert n == 1
+
+
+class TestReconcileSafety:
+    """C2:needs_reconcile 行在无 probe 时禁止盲目重发。"""
+
+    def test_needs_reconcile_row_skipped_without_probe(self, env):
+        conn, sender, probe, co = env
+        r = _ingest(co)
+        co.dispatch(r.taskid, seed_text="s", mentions=("design",))
+        sender.fail_top_level = AmbiguousSendError(["x"], -1, "timeout")
+        co.process_due_outbox()
+        sender.fail_top_level = None
+        sender.top_level.clear()
+        # 生产 serve 形态:probe 未注入
+        co_noprobe = Coordinator(conn, sender, now=lambda: "2999-01-01T00:00:00")
+        n = co_noprobe.process_due_outbox()
+        assert n == 0                      # 未发送
+        assert sender.top_level == []      # 无第二个话题
+        row = conn.execute(
+            "SELECT status, needs_reconcile, attempts FROM outbox"
+        ).fetchone()
+        assert row["status"] == "pending"  # 行保留待 probe/人工
+        assert row["needs_reconcile"] == 1
+
+    def test_with_probe_still_converges(self, env):
+        conn, sender, probe, co = env
+        r = _ingest(co)
+        co.dispatch(r.taskid, seed_text="s", mentions=("design",))
+        sender.fail_top_level = AmbiguousSendError(["x"], -1, "timeout")
+        co.process_due_outbox()
+        sender.fail_top_level = None
+        probe.found = "om_exists"
+        co_later = Coordinator(conn, sender, now=lambda: "2999-01-01T00:00:00", probe=probe)
+        assert co_later.process_due_outbox() == 1
+        assert get_task(conn, r.taskid).status == "running"
