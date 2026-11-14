@@ -25,8 +25,17 @@ python3 -m pytest tests/test_inbox.py tests/test_http.py \
 
 ```text
 tests/test_fault_injection.py: 2 passed
-全量套件:136 passed
+全量套件:141 passed
 ```
+
+## 独立评审后补强
+
+- reply 不再继承含 `--chat-id` 的 `SA_SEND_CMD`;仅 `SA_REPLY_CMD` 控制历史线程回投。
+- reconciler 对「relay 已 sent、任务仍 report_pending」按最新 completed/escalated 补 CAS,不重发。
+- 确定未发出的 SendError 清除对账标记,无 probe 的生产路径也可安全重试。
+- 评论话题锚点缺失时不写入去重记录,锚点恢复后仍可通知。
+
+以上均有先失败后通过的回归测试;最终全量 **141 passed**。
 
 ## 降级边界
 

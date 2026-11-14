@@ -141,6 +141,19 @@ def test_notify_payload_targets_topic(env):
     assert payload["root"]                   # 话题种子消息 id
 
 
+def test_missing_topic_anchor_does_not_consume_comment(env):
+    conn, taskid = env
+    # 文档链接已存在但派单锚点尚未补齐时,不能先把评论标成已消费。
+    conn.execute("UPDATE tasks SET topic_root_msg_id=NULL WHERE taskid=?", (taskid,))
+    conn.commit()
+    reader = FakeReader()
+    assert sync_doc(conn, reader, doc_token="docx_1", taskid=taskid, bot_ids=BOT_IDS) == 0
+    assert conn.execute("SELECT COUNT(*) FROM comment_inbox").fetchone()[0] == 0
+    conn.execute("UPDATE tasks SET topic_root_msg_id='om_restored' WHERE taskid=?", (taskid,))
+    conn.commit()
+    assert sync_doc(conn, reader, doc_token="docx_1", taskid=taskid, bot_ids=BOT_IDS) == 3
+
+
 def test_watch_loop_single_round_smoke(env):
     from tools.comment_watcher import watch_loop
     conn, taskid = env

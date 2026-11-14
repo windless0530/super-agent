@@ -153,6 +153,18 @@ class TestDispatch:
         co2.process_due_outbox()
         assert len(sender.top_level) == 1
 
+    def test_dispatch_senderror_retries_without_probe(self, env):
+        conn, sender, probe, co = env
+        r = _ingest(co)
+        co.dispatch(r.taskid, seed_text="[20261114-001] 标题", mentions=("design",))
+        sender.fail_top_level = SendError(["x"], 1, "definitely not sent")
+        co.process_due_outbox()
+        sender.fail_top_level = None
+        # 生产 serve/once 没有 probe;确定未发出必须可直接重试。
+        co2 = Coordinator(conn, sender, now=lambda: "2999-01-01T00:00:00")
+        co2.process_due_outbox()
+        assert len(sender.top_level) == 1
+
 
 class TestReport:
     def _running(self, env):

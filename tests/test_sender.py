@@ -80,6 +80,19 @@ def test_send_uses_explicit_session_when_configured(monkeypatch, sender):
     assert "session-full-uuid" in calls[0]
 
 
+def test_send_reply_does_not_inherit_top_level_chat_id(monkeypatch, sender):
+    monkeypatch.setenv("SA_SEND_CMD", "botmux send --chat-id {chat_id} {text}")
+    monkeypatch.delenv("SA_REPLY_CMD", raising=False)
+    calls = _patch_run(
+        monkeypatch,
+        lambda argv: FakeCompleted(stdout='{"messageId": "om_r"}'),
+    )
+    sender.send_reply("oc_g", "om_root", "回投文本")
+    argv = calls[0]
+    assert "--into" in argv and "om_root" in argv
+    assert "--chat-id" not in argv
+
+
 def test_parse_send_output_p0_formats():
     assert parse_send_output('{"message_id": "om_1"}') == "om_1"
     assert parse_send_output('{"data": {"message_id": "om_2"}}') == "om_2"

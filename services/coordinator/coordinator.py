@@ -266,10 +266,9 @@ class Coordinator:
         processed = 0
         for row in outbox.pending_due(self.conn, now):
             payload = row.payload
-            # 重发前对账:模糊失败行 / 已尝试过的派单行
-            must_reconcile = row.needs_reconcile or (
-                row.kind == "dispatch" and row.attempts > 0
-            )
+            # 每次发送前都会置 needs_reconcile;确定未发出的 SendError 会清除,
+            # 因而只有结果不确定的行才需要 probe,确定失败可安全重试。
+            must_reconcile = row.needs_reconcile
             if must_reconcile:
                 if self.probe is None:
                     # 不变式:无对账手段就不重发(宁可滞留,不可重复话题/回投)

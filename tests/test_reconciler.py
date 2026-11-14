@@ -87,6 +87,30 @@ class TestReviewFixes:
         assert t.active_role == "design"
         assert report.resent == 0  # 不重发
 
+    @pytest.mark.parametrize("outcome,expected", [
+        ("completed", "done"), ("escalated", "awaiting_decision"),
+    ])
+    def test_sent_relay_row_backfills_cas(self, env, outcome, expected):
+        conn, sender, co = env
+        r = co.ingest_task(event_id="ev_1", message_id="om_1", text="t",
+                           task_type="RD", title="A", thread_chat_id="oc_router")
+        co.dispatch(r.taskid, seed_text="s", mentions=("design",))
+        co.process_due_outbox()
+        co.handle_report({
+            "event_id": "ev_relay", "taskid": r.taskid, "outcome": outcome,
+            "phase": "designing", "source_msg_id": "om_w", "doc_version": "1",
+        })
+        # 模拟 relay 已 mark_sent,随后在 _post_send 的 CAS 前被 kill。
+        from services.coordinator import outbox as om
+        oid = conn.execute("SELECT id FROM outbox WHERE kind='relay'").fetchone()[0]
+        om.mark_sent(conn, oid, sent_msg_id="om_relay_77")
+        before = len(sender.replies)
+        report = reconcile(conn, sender, now="2999-01-01T00:00:00")
+        from services.coordinator.registry import get_task
+        assert get_task(conn, r.taskid).status == expected
+        assert len(sender.replies) == before  # 补迁移不重复回投
+        assert report.resent == 0
+
     def test_received_and_clarifying_stuck_detected(self, env):
         conn, sender, co = env
         r1 = co.ingest_task(event_id="ev_1", message_id="om_1", text="t",

@@ -4,7 +4,7 @@
 - 以指定 bot 身份(botmux 多 bot)向群/会话发消息、回复线程、加表情。
 - 命令模板可用环境变量覆盖(SA_SEND_CMD / SA_REACTION_CMD),
   P0 实测校准参数时不改代码。默认参数对齐 botmux send 已实测形态:
-  --chat-id / --top-level / --reply-to / --mention。
+  --chat-id / --top-level / --into / --mention。
 - 失败语义二分:SendError=确定未发出,可安全重试;
   AmbiguousSendError=不确定(超时/被杀),调用方必须先对账再重发。
 """
@@ -98,9 +98,8 @@ class LarkCliSender:
         return self._template("SA_SEND_CMD", DEFAULT_SEND_CMD)
 
     def _reply_template(self) -> str:
-        # SA_REPLY_CMD 独立覆盖历史线程回投;旧部署只设 SA_SEND_CMD 时仍兼容。
-        return (os.environ.get("SA_REPLY_CMD") or os.environ.get("SA_SEND_CMD")
-                or DEFAULT_REPLY_CMD)
+        # 回复与顶层发送的互斥参数不同,不能继承含 --chat-id 的 SA_SEND_CMD。
+        return os.environ.get("SA_REPLY_CMD", DEFAULT_REPLY_CMD)
 
     def _base_argv(self, chat_id: str, text: str, template: str, root: str = "") -> list[str]:
         # format_map 容忍全部占位符;全部值先 shlex.quote,

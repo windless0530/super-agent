@@ -144,7 +144,7 @@ super-agent/
 
 ## 基础层(已实现)
 
-确定性脚本与角色 Skill 已落地并全部通过本地测试(136 项,`python3 -m pytest tests/ -q`),不依赖线上飞书环境。经独立全分支评审后修复了 3 项 Critical(report 重复回投 / 无对账盲目重发 / 崩溃丢报)与 8 项 Important。P0 现场验证又修复了 botmux 发送协议、发送后硬 kill 的重复外发和真实评论 API 适配。注意:评论 watcher 是登记表的事实上的第二写者(直写 comment_inbox 与 outbox;WAL + 短事务保证与 sa-coordinator 的并发安全),与「SQLite 唯一写者」的严格表述有出入,P1 可改为经 HTTP 写入。
+确定性脚本与角色 Skill 已落地并全部通过本地测试(141 项,`python3 -m pytest tests/ -q`),不依赖线上飞书环境。经独立全分支评审后修复了 3 项 Critical(report 重复回投 / 无对账盲目重发 / 崩溃丢报)与 8 项 Important。P0 现场验证又修复了 botmux 发送协议、发送后硬 kill 的重复外发和真实评论 API 适配。注意:评论 watcher 是登记表的事实上的第二写者(直写 comment_inbox 与 outbox;WAL + 短事务保证与 sa-coordinator 的并发安全),与「SQLite 唯一写者」的严格表述有出入,P1 可改为经 HTTP 写入。
 
 | 组件 | 位置 | 说明 |
 |-|-|-|

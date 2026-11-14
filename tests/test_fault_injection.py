@@ -37,6 +37,7 @@ def _start_once(db_path: Path, fake: Path, log: Path, marker: Path, kill: bool):
     env = os.environ.copy()
     env.update({
         "SA_SEND_CMD": f"{sys.executable} {fake} {{text}}",
+        "SA_REPLY_CMD": f"{sys.executable} {fake} {{text}}",
         "FAKE_SEND_LOG": str(log),
         "FAKE_SEND_MARKER": str(marker),
         "FAKE_SEND_KILL": "1" if kill else "0",

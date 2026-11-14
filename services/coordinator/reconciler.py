@@ -68,6 +68,33 @@ def _backfill_sent_dispatches(conn) -> int:
     return fixed
 
 
+def _backfill_sent_relays(conn) -> int:
+    """relay 已发出但 report_pending CAS 未落时,按最新 relay 幂等补迁移。"""
+    fixed = 0
+    rows = conn.execute(
+        "SELECT o.taskid, o.payload FROM outbox o"
+        " JOIN tasks t ON t.taskid=o.taskid"
+        " WHERE o.kind='relay' AND o.status='sent' AND t.status='report_pending'"
+        " AND o.id=(SELECT MAX(o2.id) FROM outbox o2"
+        "           WHERE o2.taskid=o.taskid AND o2.kind='relay')"
+    ).fetchall()
+    for row in rows:
+        payload = json.loads(row["payload"])
+        outcome = payload.get("outcome")
+        status = {"completed": "done", "escalated": "awaiting_decision"}.get(outcome)
+        if status is None:
+            continue
+        task = get_task(conn, row["taskid"])
+        if task is None:
+            continue
+        try:
+            cas_update(conn, task.taskid, task.version, status=status)
+            fixed += 1
+        except Exception:  # noqa: BLE001 — 并发推进后以登记表现状为准
+            continue
+    return fixed
+
+
 def scan_stuck(conn, now: str) -> list[dict]:
     """检出卡死任务(只报告不改状态);供 reconciler 与 serve 周期巡检共用。"""
     now_dt = _parse_iso(now)
@@ -90,6 +117,7 @@ def reconcile(conn, sender, now: str) -> ReconcileReport:
     """启动/定时对账:崩溃窗口恢复 + 重发到期 outbox + 检出卡死任务(只报告)。"""
     co = Coordinator(conn, sender)
     _backfill_sent_dispatches(conn)
+    _backfill_sent_relays(conn)
     # needs_reconcile 行与普通 pending 行统一交给 process_due_outbox;
     # 其内部对 needs_reconcile 行执行 probe 对账(无 probe 时安全滞留)
     resent = co.process_due_outbox(now=now)

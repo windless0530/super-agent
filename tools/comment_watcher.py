@@ -239,6 +239,11 @@ def sync_doc(
     bot_ids: tuple[str, ...],
 ) -> int:
     """同步一篇文档的评论;返回新增 notify 条数(去重后用户侧新内容)。"""
+    task = get_task(conn, taskid)
+    if task is None or not task.group_chat_id or not task.topic_root_msg_id:
+        # 不消费评论:锚点补齐后下轮仍能通知,避免 _record 后永久去重吞掉。
+        logger.warning("任务 %s 无话题锚点,本轮评论暂不同步", taskid)
+        return 0
     notified = 0
     for item, replies, meta in _walk_comments(reader, doc_token):
         comment_id = item["comment_id"]
