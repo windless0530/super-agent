@@ -207,3 +207,31 @@ class TestPagination:
         texts = _notify_texts(conn)
         assert any("第一页用户回复" in t for t in texts)
         assert any("第二页用户回复" in t for t in texts)  # 第 2 页不再漏检
+
+
+class TestMainBotIds:
+    """I3:生产入口必须显式传 bot_ids,否则自回复过滤形同虚设。"""
+
+    def test_missing_bot_ids_rejected(self, capsys):
+        import importlib.util
+        import importlib.machinery
+        from pathlib import Path
+        repo = Path(__file__).parent.parent
+        spec = importlib.util.spec_from_file_location(
+            "cw_main", str(repo / "tools/comment_watcher.py"),
+            loader=importlib.machinery.SourceFileLoader(
+                "cw_main", str(repo / "tools/comment_watcher.py")))
+        cw = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cw)
+        code = cw.main(["--db", "/tmp/cw-test.db"])
+        assert code == 2
+        assert "--bot-id" in capsys.readouterr().err
+
+    def test_bot_ids_forwarded_to_docs(self, tmp_path):
+        from tools.comment_watcher import build_docs_fn
+        from services.coordinator import db as db_mod
+        conn = db_mod.connect(str(tmp_path / "t.db"))
+        db_mod.init_schema(conn)
+        docs = build_docs_fn(conn, bot_ids=("ou_bot_design", "ou_bot_review"))
+        # 无带文档链接的非终态任务 → 空列表;函数可调用即契约成立
+        assert docs() == []

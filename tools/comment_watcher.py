@@ -241,19 +241,8 @@ def watch_loop(
         stop.wait(interval)
 
 
-def main() -> int:
-    import argparse
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", default="registry/tasks.db")
-    parser.add_argument("--active-interval", type=float, default=3.0)
-    parser.add_argument("--idle-interval", type=float, default=60.0)
-    args = parser.parse_args()
-
-    from services.coordinator import db as db_mod
-
-    conn = db_mod.connect(args.db)
-    db_mod.init_schema(conn)
+def build_docs_fn(conn, bot_ids: tuple[str, ...]):
+    """构造 docs() 目标列表:非 done 且带文档链接的任务 × 其文档。"""
 
     def docs():
         rows = conn.execute(
@@ -264,9 +253,33 @@ def main() -> int:
         for r in rows:
             for link in json.loads(r[1]):
                 out.append({"doc_token": link.rsplit("/", 1)[-1],
-                            "taskid": r[0], "bot_ids": ()})
+                            "taskid": r[0], "bot_ids": bot_ids})
         return out
 
+    return docs
+
+
+def main(argv=None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db", default="registry/tasks.db")
+    parser.add_argument("--bot-id", action="append", default=[],
+                        help="责任 bot 的 open_id/user_id,可重复;"
+                             "缺失则自回复过滤失效,程序拒绝启动")
+    parser.add_argument("--active-interval", type=float, default=3.0)
+    parser.add_argument("--idle-interval", type=float, default=60.0)
+    args = parser.parse_args(argv)
+    if not args.bot_id:
+        print("错误: 至少一个 --bot-id(否则 bot 会被自己的回复唤醒,死循环)",
+              file=sys.stderr)
+        return 2
+
+    from services.coordinator import db as db_mod
+
+    conn = db_mod.connect(args.db)
+    db_mod.init_schema(conn)
+    docs = build_docs_fn(conn, tuple(args.bot_id))
     logging.basicConfig(level=logging.INFO)
     watch_loop(conn, LarkCliCommentReader(), docs,
                active_interval=args.active_interval,
