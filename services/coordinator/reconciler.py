@@ -68,17 +68,11 @@ def _backfill_sent_dispatches(conn) -> int:
     return fixed
 
 
-def reconcile(conn, sender, now: str) -> ReconcileReport:
-    """启动/定时对账:崩溃窗口恢复 + 重发到期 outbox + 检出卡死任务(只报告)。"""
-    co = Coordinator(conn, sender)
-    _backfill_sent_dispatches(conn)
-    # needs_reconcile 行与普通 pending 行统一交给 process_due_outbox;
-    # 其内部对 needs_reconcile 行执行 probe 对账(无 probe 时安全滞留)
-    resent = co.process_due_outbox(now=now)
+def scan_stuck(conn, now: str) -> list[dict]:
+    """检出卡死任务(只报告不改状态);供 reconciler 与 serve 周期巡检共用。"""
     now_dt = _parse_iso(now)
     stuck = []
-    tasks = list_non_terminal(conn)
-    for t in tasks:
+    for t in list_non_terminal(conn):
         threshold = _THRESHOLDS.get(t.status)
         if threshold is None:
             continue
@@ -89,4 +83,16 @@ def reconcile(conn, sender, now: str) -> ReconcileReport:
                 "status": t.status,
                 "reason": f"{t.status} 停留 {age} 超过 {threshold}",
             })
+    return stuck
+
+
+def reconcile(conn, sender, now: str) -> ReconcileReport:
+    """启动/定时对账:崩溃窗口恢复 + 重发到期 outbox + 检出卡死任务(只报告)。"""
+    co = Coordinator(conn, sender)
+    _backfill_sent_dispatches(conn)
+    # needs_reconcile 行与普通 pending 行统一交给 process_due_outbox;
+    # 其内部对 needs_reconcile 行执行 probe 对账(无 probe 时安全滞留)
+    resent = co.process_due_outbox(now=now)
+    tasks = list_non_terminal(conn)
+    stuck = scan_stuck(conn, now)
     return ReconcileReport(non_terminal=len(tasks), resent=resent, stuck=stuck)

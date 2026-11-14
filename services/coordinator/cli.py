@@ -8,6 +8,7 @@
 
 import argparse
 import json
+import logging
 import os
 import sys
 import threading
@@ -17,12 +18,14 @@ from urllib.parse import parse_qs, urlparse
 from . import db
 from .coordinator import Coordinator, ReportRejected, utcnow_iso
 from .registry import TaskNotFound
-from .reconciler import reconcile
+from .reconciler import reconcile, scan_stuck
 from .report import InvalidReport
 from .sender import LarkCliSender
 
 DEFAULT_DB_PATH = "registry/tasks.db"
 POLL_INTERVAL_SECONDS = 5
+
+logger = logging.getLogger("coordinator")
 
 
 class LockHeld(Exception):
@@ -115,17 +118,40 @@ def _list_tasks(co: Coordinator, status: str | None):
     return list_non_terminal(co.conn)
 
 
-def serve_in_thread(co: Coordinator, port: int = 8787, ready=None):
-    """测试友好:线程内起服务,ready(port) 回调通知端口。"""
+def serve_in_thread(co: Coordinator, port: int = 8787, ready=None,
+                    startup_now: str | None = None, with_watchdog: bool = True):
+    """测试友好:启动对账 + 线程内起服务,ready(port) 回调通知端口。"""
+    if with_watchdog:
+        _startup_reconcile_and_log(co, startup_now or utcnow_iso())
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(co))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     if ready:
         ready(server.server_address[1])
-    # 返回可通过 join 停止的线程;server 随 daemon 退出
-    stopper = threading.Thread(target=server.shutdown, daemon=True)
-    stopper.start() if False else None  # 占位:shutdown 由测试进程退出兜底
     return _Joinable(thread, server)
+
+
+def _startup_reconcile_and_log(co: Coordinator, now: str):
+    report = reconcile(co.conn, co.sender, now=now)
+    for s in report.stuck:
+        logger.error("启动对账:任务卡死 %s %s(%s)", s["taskid"], s["status"], s["reason"])
+
+
+def _watchdog_loop(co: Coordinator, stop: threading.Event,
+                   stuck_every_rounds: int = 12):
+    """周期卡死巡检(每 N 轮 5s 即约 1 分钟一次),只记日志/告警。"""
+    rounds = 0
+    while not stop.is_set():
+        stop.wait(POLL_INTERVAL_SECONDS)
+        rounds += 1
+        if rounds % stuck_every_rounds:
+            continue
+        try:
+            for s in scan_stuck(co.conn, utcnow_iso()):
+                logger.error("巡检:任务卡死 %s %s(%s)",
+                             s["taskid"], s["status"], s["reason"])
+        except Exception:  # noqa: BLE001
+            logger.exception("卡死巡检异常(继续)")
 
 
 class _Joinable:
@@ -159,6 +185,12 @@ def serve(host: str, port: int, db_path: str) -> None:
 
     poll_lock = threading.Lock()
     threading.Thread(target=poll, daemon=True).start()
+    # 启动对账 + 周期卡死巡检(I6:serve 主运行模式与 once 同等服务面)
+    _startup_reconcile_and_log(co, utcnow_iso())
+    watchdog_stop = threading.Event()
+    threading.Thread(
+        target=_watchdog_loop, args=(co, watchdog_stop), daemon=True
+    ).start()
     print(f"sa-coordinator serving on {host}:{port} (db={db_path})", flush=True)
     try:
         ThreadingHTTPServer((host, port), make_handler(co, poll_lock)).serve_forever()

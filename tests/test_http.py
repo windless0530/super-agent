@@ -155,3 +155,45 @@ class TestReviewFixes:
             assert "error" in body
         finally:
             th.join(timeout=5)
+
+
+class TestServeWatchdog:
+    """I6:serve 启动即对账;poll 周期检出卡死任务并记录日志。"""
+
+    def test_startup_reconcile_logs_stuck(self, tmp_path, caplog):
+        import logging
+        from services.coordinator import cli as cli_mod
+        from services.coordinator.coordinator import Coordinator
+        from tests.test_coordinator import FakeSender
+        conn = db.connect(str(tmp_path / "t.db"))
+        db.init_schema(conn)
+        db.seed_task_types(conn)
+        co = Coordinator(conn, FakeSender())
+        # 造一个 received 超时任务
+        co.ingest_task(event_id="ev_1", message_id="om_1", text="t",
+                       task_type="RD", title="A")
+        conn.execute("UPDATE tasks SET updated_at='2000-01-01T00:00:00'")
+        conn.commit()
+        holder = {}
+        with caplog.at_level(logging.ERROR, logger="coordinator"):
+            th = cli_mod.serve_in_thread(
+                co, port=0, ready=lambda p: holder.__setitem__("p", p),
+                startup_now="2999-01-01T00:00:00",
+            )
+            try:
+                assert any("20261114-001" in r.message for r in caplog.records)
+            finally:
+                th.join(timeout=5)
+
+    def test_scan_stuck_unit(self, tmp_path):
+        from services.coordinator.coordinator import Coordinator
+        from services.coordinator.reconciler import scan_stuck
+        from tests.test_coordinator import FakeSender
+        conn = db.connect(str(tmp_path / "t.db"))
+        db.init_schema(conn)
+        db.seed_task_types(conn)
+        co = Coordinator(conn, FakeSender())
+        r = co.ingest_task(event_id="ev_1", message_id="om_1", text="t",
+                           task_type="RD", title="A")
+        stuck = scan_stuck(conn, now="2999-01-01T00:00:00")
+        assert [s["taskid"] for s in stuck] == [r.taskid]
