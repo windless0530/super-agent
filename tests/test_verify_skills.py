@@ -31,6 +31,7 @@ description: 完成协议与 sactl report 上报规范
 # sa-report
 
 收尾调用 sactl report,事件字段齐全,幂等,三轮规则必须遵守。
+字段:event_id、taskid、outcome、phase、source_msg_id、doc_version、payload。
 event_id 每次生成一次复用;outcome 取 completed 或 escalated。
 """
 
