@@ -15,9 +15,11 @@ import shlex
 import subprocess
 from typing import Protocol, runtime_checkable
 
-DEFAULT_SEND_CMD = "botmux send --bot {bot} --chat-id {chat_id}"
+DEFAULT_SEND_CMD = "botmux send --chat-id {chat_id} {text}"
+DEFAULT_REPLY_CMD = "botmux send --into {root} {text}"
 DEFAULT_REACTION_CMD = (
-    "lark-cli im message add-reaction --chat-id {chat_id} --message-id {msg_id} --emoji {emoji}"
+    "lark-cli im reactions create --message-id {msg_id} "
+    "--data {reaction_body} --as bot"
 )
 
 _TIMEOUT_SECONDS = 30
@@ -51,17 +53,24 @@ class Sender(Protocol):
 
 
 def parse_send_output(stdout: str) -> str | None:
-    """从 botmux/lark-cli JSON 输出提取 message_id(兼容两级嵌套)。"""
-    try:
-        data = json.loads(stdout)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if isinstance(data, dict):
-        if isinstance(data.get("message_id"), str):
-            return data["message_id"]
+    """提取 message_id;兼容 lark-cli 信封与 botmux 的混合文本/camelCase。"""
+    candidates = [stdout]
+    candidates.extend(reversed(stdout.splitlines()))
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        for key in ("message_id", "messageId"):
+            if isinstance(data.get(key), str):
+                return data[key]
         nested = data.get("data")
-        if isinstance(nested, dict) and isinstance(nested.get("message_id"), str):
-            return nested["message_id"]
+        if isinstance(nested, dict):
+            for key in ("message_id", "messageId"):
+                if isinstance(nested.get(key), str):
+                    return nested[key]
     return None
 
 
@@ -88,49 +97,74 @@ class LarkCliSender:
     def _send_template(self) -> str:
         return self._template("SA_SEND_CMD", DEFAULT_SEND_CMD)
 
-    def _base_argv(self, chat_id: str, text: str, template: str) -> list[str]:
+    def _reply_template(self) -> str:
+        # SA_REPLY_CMD 独立覆盖历史线程回投;旧部署只设 SA_SEND_CMD 时仍兼容。
+        return (os.environ.get("SA_REPLY_CMD") or os.environ.get("SA_SEND_CMD")
+                or DEFAULT_REPLY_CMD)
+
+    def _base_argv(self, chat_id: str, text: str, template: str, root: str = "") -> list[str]:
         # format_map 容忍全部占位符;全部值先 shlex.quote,
         # 模板含 {text} 时空格/flag 注入被引号挡住,保持单元素
         class _Safe(dict):
             def __missing__(self, key):
                 return ""
 
+        session_id = os.environ.get("SA_BOTMUX_SESSION_ID", "")
         rendered = template.format_map(
             _Safe(bot=shlex.quote(self.sender_bot),
                   chat_id=shlex.quote(chat_id),
-                  text=shlex.quote(text))
+                  text=shlex.quote(text),
+                  root=shlex.quote(root),
+                  session_id=shlex.quote(session_id))
         )
-        return [a for a in shlex.split(rendered) if a]
+        argv = [a for a in shlex.split(rendered) if a]
+        if session_id and "{session_id}" not in template:
+            argv += ["--session-id", session_id]
+        return argv
+
+    @staticmethod
+    def _finish_send_argv(argv: list[str], text: str, template: str,
+                          mentions: tuple[str, ...]) -> list[str]:
+        if "{text}" not in template:
+            argv.append(text)  # botmux send 正文是位置参数,不支持 --text
+        if mentions:
+            for mention in mentions:
+                argv += ["--mention", mention]
+        else:
+            argv.append("--no-mention")
+        return argv
 
     def send_top_level(
         self, chat_id: str, text: str, mentions: tuple[str, ...] = ()
     ) -> str:
         template = self._send_template()
         argv = self._base_argv(chat_id, text, template) + ["--top-level"]
-        if "{text}" not in template:
-            argv += ["--text", text]
-        if mentions:
-            argv += ["--mention", ",".join(mentions)]
+        argv = self._finish_send_argv(argv, text, template, mentions)
         return self._extract(self._run(argv), argv)
 
     def send_reply(
         self, chat_id: str, root_msg_id: str, text: str, mentions: tuple[str, ...] = ()
     ) -> str:
-        template = self._send_template()
-        argv = self._base_argv(chat_id, text, template) + ["--reply-to", root_msg_id]
-        if "{text}" not in template:
-            argv += ["--text", text]
-        if mentions:
-            argv += ["--mention", ",".join(mentions)]
+        template = self._reply_template()
+        # P0 实测:--into 可回复任意历史 thread;--reply-to 仅限本会话保留的进线,
+        # 且二者都不能与 --chat-id 混用。默认回复模板因此只带 --into。
+        argv = self._base_argv(chat_id, text, template, root=root_msg_id)
+        if "{root}" not in template:
+            argv += ["--into", root_msg_id]
+        argv = self._finish_send_argv(argv, text, template, mentions)
         return self._extract(self._run(argv), argv)
 
     def add_reaction(self, chat_id: str, msg_id: str, emoji: str) -> None:
         template = self._template("SA_REACTION_CMD", DEFAULT_REACTION_CMD)
+        reaction_body = json.dumps(
+            {"reaction_type": {"emoji_type": emoji}}, ensure_ascii=False
+        )
         argv = shlex.split(
             template.format(
                 chat_id=shlex.quote(chat_id),
                 msg_id=shlex.quote(msg_id),
                 emoji=shlex.quote(emoji),
+                reaction_body=shlex.quote(reaction_body),
             )
         )
         self._run(argv)

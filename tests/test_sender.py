@@ -36,38 +36,57 @@ def _patch_run(monkeypatch, behavior):
     return calls
 
 
-def test_send_top_level_builds_command(monkeypatch, sender):
+def test_send_top_level_builds_p0_verified_command(monkeypatch, sender):
     calls = _patch_run(
         monkeypatch,
-        lambda argv: FakeCompleted(stdout='{"message_id": "om_9"}'),
+        lambda argv: FakeCompleted(stdout='{"messageId": "om_9"}'),
     )
-    msg_id = sender.send_top_level("oc_g", "种子文本", mentions=("bot_design",))
+    msg_id = sender.send_top_level("oc_g", "种子文本", mentions=("ou_design:设计",))
     argv = calls[0]
     assert msg_id == "om_9"
-    assert argv[:3] == ["botmux", "send", "--bot"]
-    assert "router" in argv
+    assert argv[:2] == ["botmux", "send"]
+    assert "--bot" not in argv  # botmux 3.59.10 send 不支持 --bot
+    assert "--text" not in argv  # 正文是位置参数
     assert "--chat-id" in argv and "oc_g" in argv
     assert "--top-level" in argv
     assert "种子文本" in argv
-    assert "--mention" in argv and "bot_design" in argv
+    assert "--mention" in argv and "ou_design:设计" in argv
+    assert "--no-mention" not in argv
 
 
-def test_send_reply_uses_reply_to(monkeypatch, sender):
+def test_send_reply_uses_into_for_historical_thread(monkeypatch, sender):
     calls = _patch_run(
         monkeypatch,
-        lambda argv: FakeCompleted(stdout='{"message_id": "om_r"}'),
+        lambda argv: FakeCompleted(stdout='{"messageId": "om_r"}'),
     )
     msg_id = sender.send_reply("oc_g", "om_root", "回投文本")
     assert msg_id == "om_r"
-    argv = " ".join(calls[0])
-    assert "--reply-to" in argv and "om_root" in argv
-    # mentions 为空时不拼 --mention
-    assert "--mention" not in argv
+    argv = calls[0]
+    assert "--into" in argv and "om_root" in argv
+    assert "--reply-to" not in argv
+    assert "--chat-id" not in argv  # --into 不可与 --chat-id 混用
+    assert "回投文本" in argv and "--text" not in argv
+    assert "--no-mention" in argv
 
 
-def test_parse_send_output_both_formats():
+def test_send_uses_explicit_session_when_configured(monkeypatch, sender):
+    monkeypatch.setenv("SA_BOTMUX_SESSION_ID", "session-full-uuid")
+    calls = _patch_run(
+        monkeypatch,
+        lambda argv: FakeCompleted(stdout='{"messageId": "om_s"}'),
+    )
+    sender.send_top_level("oc_g", "种子文本")
+    assert "--session-id" in calls[0]
+    assert "session-full-uuid" in calls[0]
+
+
+def test_parse_send_output_p0_formats():
     assert parse_send_output('{"message_id": "om_1"}') == "om_1"
     assert parse_send_output('{"data": {"message_id": "om_2"}}') == "om_2"
+    assert parse_send_output('{"messageId": "om_3"}') == "om_3"
+    assert parse_send_output(
+        '✓ 已发送 om_4\n进度消息已发送\n{"success":true,"messageId":"om_4"}'
+    ) == "om_4"
     assert parse_send_output("not json") is None
     assert parse_send_output('{"foo": 1}') is None
 
@@ -109,14 +128,15 @@ def test_env_template_override(monkeypatch, sender):
     assert "abc" in argv and "hello" in argv
 
 
-def test_add_reaction(monkeypatch, sender):
+def test_add_reaction_uses_p0_verified_api(monkeypatch, sender):
     calls = _patch_run(monkeypatch, lambda argv: FakeCompleted(stdout="{}"))
     sender.add_reaction("oc_g", "om_1", "Get")
     argv = calls[0]
-    assert argv[0] == "lark-cli"
-    joined = " ".join(argv)
-    assert "add-reaction" in joined or "reaction" in joined
-    assert "Get" in argv
+    assert argv[:4] == ["lark-cli", "im", "reactions", "create"]
+    assert "--message-id" in argv and "om_1" in argv
+    assert '--data' in argv
+    assert '{"reaction_type": {"emoji_type": "Get"}}' in argv
+    assert "--as" in argv and "bot" in argv
 
 
 def test_text_not_shell_interpreted(monkeypatch, sender):
