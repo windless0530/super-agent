@@ -144,7 +144,7 @@ super-agent/
 
 ## 基础层(已实现)
 
-确定性脚本与角色 Skill 已落地并全部通过本地测试(129 项,`python3 -m pytest tests/ -q`),不依赖线上飞书环境。经独立全分支评审后修复了 3 项 Critical(report 重复回投 / 无对账盲目重发 / 崩溃丢报)与 8 项 Important。注意:评论 watcher 是登记表的事实上的第二写者(直写 comment_inbox 与 outbox;WAL + 短事务保证与 sa-coordinator 的并发安全),与「SQLite 唯一写者」的严格表述有出入,P1 可改为经 HTTP 写入。
+确定性脚本与角色 Skill 已落地并全部通过本地测试(136 项,`python3 -m pytest tests/ -q`),不依赖线上飞书环境。经独立全分支评审后修复了 3 项 Critical(report 重复回投 / 无对账盲目重发 / 崩溃丢报)与 8 项 Important。P0 现场验证又修复了 botmux 发送协议、发送后硬 kill 的重复外发和真实评论 API 适配。注意:评论 watcher 是登记表的事实上的第二写者(直写 comment_inbox 与 outbox;WAL + 短事务保证与 sa-coordinator 的并发安全),与「SQLite 唯一写者」的严格表述有出入,P1 可改为经 HTTP 写入。
 
 | 组件 | 位置 | 说明 |
 |-|-|-|
@@ -159,6 +159,7 @@ super-agent/
 | sactl | `tools/sactl` | worker 上报 CLI:event_id 生成一次复用、3 次退避重试、退出码 0/3/4 |
 | 评论 watcher | `tools/comment_watcher.py` | 轮询降级:分页展开、(reply_id+hash) 去重、bot 自回复过滤、reaction/is_solved 单独记录、活动/空闲分频 |
 | P0 探针 | `tools/probe/` | #1 评论事件探针(dry-run 可验证)+ 八项 runbook(`tools/probe/README.md`) |
+| systemd | `systemd/` | coordinator 常驻、watcher 轮询降级、重启自愈;env 示例与 P0 实测见 `docs/p0/probe7-systemd.md` |
 | Skill 验证器 | `tools/verify_skills.py` | 7 个 skill 结构校验 + sa-report↔report.py 契约交叉校验(防提示词与代码漂移) |
 | 角色 Skill | `skills/sa-*/SKILL.md` | 7 个:router/report/design/review/planner/executor/devreview |
 | 角色卡 | `bots/<role>/CLAUDE.md` | 6 张:身份+红线(与 Skill 分离) |
@@ -176,7 +177,7 @@ tools/sactl report --taskid <id> --outcome completed --phase <p> \
 python3 tools/probe/probe_comment_event.py --dry-run         # P0 探针 #1 演练
 ```
 
-实施计划与逐任务记录:`docs/superpowers/plans/2026-11-14-foundation-skills-and-scripts.md`。
+实施计划与逐任务记录:`docs/superpowers/plans/2026-11-14-foundation-skills-and-scripts.md`。P0 八项现场记录:`docs/p0/`(含每项结论、实测参数与未完成门禁)。
 
 ## 复用 / 自建边界
 
