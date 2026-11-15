@@ -2,3 +2,6 @@ __pycache__/
 registry/
 tasks/
 .venv/
+# per-bot 会话级模型凭据(含 ANTHROPIC_AUTH_TOKEN,绝不入库)
+bots/*/.claude/settings.json
+bots/*/.claude/settings.local.json

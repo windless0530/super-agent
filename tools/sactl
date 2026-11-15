@@ -146,6 +146,67 @@ def cmd_route(args) -> int:
     return 0
 
 
+def _types_conn(db_path: str | None):
+    import os
+    import sqlite3
+    path = db_path or os.environ.get("SA_DB") or "registry/tasks.db"
+    if not os.path.exists(path):
+        print(f"sactl: 数据库不存在: {path}(先 init-db)", file=sys.stderr)
+        raise SystemExit(4)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def cmd_types(args) -> int:
+    """类型注册表运维:set-group 回填群、set-member 回填 mention 令牌、show 查看。"""
+    if args.action == "set-group" and not (args.arg1 and args.arg2):
+        print("sactl: set-group 需要 <type_code> <chat_id>", file=sys.stderr)
+        return 3
+    if args.action == "set-member" and not (args.arg1 and args.arg2):
+        print("sactl: set-member 需要 <role> <mention>", file=sys.stderr)
+        return 3
+    conn = _types_conn(args.db)
+    try:
+        if args.action == "set-group":
+            cur = conn.execute(
+                "UPDATE task_types SET group_chat_id=? WHERE type_code=? AND enabled=1",
+                (args.arg2, args.arg1),
+            )
+            if cur.rowcount == 0:
+                print(f"sactl: 未知或未启用的类型: {args.arg1}", file=sys.stderr)
+                return 3
+            conn.commit()
+            print(f"ok: {args.arg1} -> {args.arg2}")
+            return 0
+        if args.action == "set-member":
+            conn.execute(
+                "INSERT INTO role_members(role, mention) VALUES(?,?)"
+                " ON CONFLICT(role) DO UPDATE SET mention=excluded.mention",
+                (args.arg1, args.arg2),
+            )
+            conn.commit()
+            print(f"ok: {args.arg1} -> {args.arg2}")
+            return 0
+        # show
+        rows = []
+        for r in conn.execute(
+            "SELECT type_code, name, group_chat_id, roles, rounds_limit,"
+            " needs_doc, can_dev, enabled FROM task_types ORDER BY type_code"
+        ):
+            members = {m["role"]: m["mention"] for m in conn.execute(
+                "SELECT role, mention FROM role_members")}
+            row = dict(r)
+            row["roles"] = json.loads(row["roles"])
+            row["members"] = {k: v for k, v in members.items()
+                              if k in row["roles"]}
+            rows.append(row)
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        conn.close()
+
+
 def cmd_clarified(args) -> int:
     """澄清答复上报:回到可路由态(--new-task 则作为新任务接入)。"""
     body = {"taskid": args.taskid, "answer": args.answer,
@@ -215,6 +276,15 @@ def main(argv=None) -> int:
     p.add_argument("--root-msg-id")
     p.add_argument("--url")
     p.set_defaults(func=cmd_clarified)
+
+    p = sub.add_parser("types", help="类型注册表运维(本地库)")
+    p.add_argument("action", choices=["set-group", "set-member", "show"])
+    p.add_argument("arg1", nargs="?",
+                   help="set-group=type_code / set-member=role")
+    p.add_argument("arg2", nargs="?",
+                   help="set-group=chat_id / set-member=mention(ou_xxx:显示名)")
+    p.add_argument("--db", help="registry/tasks.db 路径(默认环境变量 SA_DB)")
+    p.set_defaults(func=cmd_types)
 
     args = parser.parse_args(argv)
     if args.cmd == "task":
