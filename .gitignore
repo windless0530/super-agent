@@ -9,3 +9,11 @@ bots/*/.claude/settings.local.json
 # 本地 harness 目录(worktree、会话设置),不入库
 .claude/
 .superpowers/
+
+# worker 会话运行产物不入库(仅保留 CLAUDE.md 与 .claude/skills 挂载)
+bots/*/*
+!bots/*/CLAUDE.md
+!bots/*/.claude
+bots/*/.claude/*
+!bots/*/.claude/skills
+!bots/*/.claude/skills/**
