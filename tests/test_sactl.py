@@ -168,3 +168,49 @@ def test_report_409_no_retry_exit3(monkeypatch):
     )
     assert code == 3
     assert len(fake.requests) == 1
+
+
+class TestIngest:
+    """ingest 子命令:/ingest 报文、退出码与幂等语义。"""
+
+    def _run_ingest(self, monkeypatch, responses, argv):
+        fake = URLOk(responses)
+        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        monkeypatch.setattr(sactl.time, "sleep", lambda s: None)
+        code = sactl.main(["ingest"] + argv)
+        return code, fake
+
+    def test_ingest_ok_exit0(self, monkeypatch, capsys):
+        code, fake = self._run_ingest(
+            monkeypatch,
+            [FakeResponse(200, {"ok": True, "taskid": "20261115-001", "duplicate": False})],
+            ["--message-id", "om_a", "--chat-id", "oc_r",
+             "--root-msg-id", "om_root", "--text", "帮我调研X",
+             "--sender-open-id", "ou_u"],
+        )
+        assert code == 0
+        req = fake.requests[0]
+        assert req["url"].endswith("/ingest")
+        assert req["body"] == {"message_id": "om_a", "chat_id": "oc_r",
+                               "root_msg_id": "om_root", "text": "帮我调研X",
+                               "sender_open_id": "ou_u"}
+        out = json.loads(capsys.readouterr().out)
+        assert out["taskid"] == "20261115-001" and out["duplicate"] is False
+
+    def test_ingest_invalid_exit3(self, monkeypatch):
+        code, _ = self._run_ingest(
+            monkeypatch,
+            [FakeResponse(422, {"error": "缺少 text"})],
+            ["--message-id", "om_a", "--chat-id", "oc",
+             "--root-msg-id", "r", "--text", ""],
+        )
+        assert code == 3
+
+    def test_ingest_unreachable_exit4(self, monkeypatch):
+        code, _ = self._run_ingest(
+            monkeypatch,
+            [urllib.error.URLError("down")],
+            ["--message-id", "om_a", "--chat-id", "oc",
+             "--root-msg-id", "r", "--text", "t"],
+        )
+        assert code == 4

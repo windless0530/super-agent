@@ -118,13 +118,19 @@ def create_task(
     thread_a_chat_id: str | None = None,
     parent_task_id: str | None = None,
     payload: dict | None = None,
+    placeholder: bool = False,
 ) -> Task:
-    """建任务(status=received,version=0),同事务幂等写 inbox_events(kind='task')。"""
-    row = conn.execute(
-        "SELECT 1 FROM task_types WHERE type_code=? AND enabled=1", (type,)
-    ).fetchone()
-    if row is None:
-        raise UnknownTaskType(type)
+    """建任务(status=received,version=0),同事务幂等写 inbox_events(kind='task')。
+
+    placeholder=True 允许 type 不在注册表(仅 /ingest 的 PENDING 占位用;
+    /route 回填真实类型时必须经注册表校验)。
+    """
+    if not placeholder:
+        row = conn.execute(
+            "SELECT 1 FROM task_types WHERE type_code=? AND enabled=1", (type,)
+        ).fetchone()
+        if row is None:
+            raise UnknownTaskType(type)
     now = _now()
     today = now[:10].replace("-", "")
     # 当日序号(循环防并发冲突,taskid_seq 已保证唯一,此处仅防御)

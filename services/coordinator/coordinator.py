@@ -84,6 +84,7 @@ class Coordinator:
         title: str,
         thread_chat_id: str | None = None,
         thread_root_msg_id: str | None = None,
+        allow_placeholder_type: bool = False,
     ) -> IngestResult:
         """任务消息接入:幂等(重复事件返回既有任务,不再 Get)。"""
         claim = claim_event(
@@ -108,6 +109,7 @@ class Coordinator:
             thread_a_msg_id=thread_root_msg_id or message_id,
             thread_a_chat_id=thread_chat_id,
             payload={"text": text},
+            placeholder=allow_placeholder_type,
         )
         bind_taskid(self.conn, event_id, task.taskid)
         # Get 表情:非可靠链路,失败仅记日志

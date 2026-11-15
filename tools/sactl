@@ -4,6 +4,7 @@
 子命令:
   report  提交完成/升级事件(POST /report)
   task    查看任务(show)
+  ingest  任务消息接入(POST /ingest,幂等)
 
 退出码:0 = accepted 或 duplicate;3 = 服务端拒绝(422);4 = 不可达。
 幂等:event_id 每次调用生成一次,跨重试复用;服务端按 event_id 去重。
@@ -94,6 +95,29 @@ def cmd_task(args) -> int:
     return 0
 
 
+def cmd_ingest(args) -> int:
+    """v1.2 固定动作 1:Router 会话收到任务消息后先落库、加 Get、取 taskid。"""
+    body = {
+        "message_id": args.message_id,
+        "chat_id": args.chat_id,
+        "root_msg_id": args.root_msg_id,
+        "text": args.text,
+    }
+    if args.sender_open_id:
+        body["sender_open_id"] = args.sender_open_id
+    url = _base_url(args.url) + "/ingest"
+    try:
+        status, resp = _post(url, body)
+    except Exception as e:  # noqa: BLE001
+        print(f"sactl: 不可达 {url}: {e}", file=sys.stderr)
+        return 4
+    if status in (422, 409):
+        print(f"sactl: 被拒绝: {resp.get('error') or resp.get('reason')}", file=sys.stderr)
+        return 3
+    print(json.dumps(resp, ensure_ascii=False))
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="sactl", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -113,6 +137,15 @@ def main(argv=None) -> int:
     p.add_argument("taskid_arg", metavar="taskid")
     p.add_argument("--url")
     p.set_defaults(func=cmd_task)
+
+    p = sub.add_parser("ingest", help="任务消息接入(幂等,返回 taskid)")
+    p.add_argument("--message-id", required=True)
+    p.add_argument("--chat-id", required=True)
+    p.add_argument("--root-msg-id", required=True)
+    p.add_argument("--text", required=True)
+    p.add_argument("--sender-open-id")
+    p.add_argument("--url")
+    p.set_defaults(func=cmd_ingest)
 
     args = parser.parse_args(argv)
     if args.cmd == "task":

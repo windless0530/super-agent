@@ -77,7 +77,8 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
                 self._json(404, {"error": "not found"})
 
         def do_POST(self):  # noqa: N802
-            if urlparse(self.path).path != "/report":
+            path = urlparse(self.path).path
+            if path not in ("/report", "/ingest"):
                 self._json(404, {"error": "not found"})
                 return
             try:
@@ -88,9 +89,12 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
                 return
             try:
                 with lock:
-                    body = co.handle_report(event)
+                    if path == "/ingest":
+                        body = _handle_ingest(co, event)
+                    else:
+                        body = co.handle_report(event)
                 self._json(200, body)
-            except InvalidReport as e:
+            except (InvalidIngest, InvalidReport) as e:
                 self._json(422, {"error": str(e)})
             except TaskNotFound as e:
                 self._json(422, {"error": f"任务不存在: {e}"})
@@ -98,13 +102,42 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
                 self._json(409, e.body)
             except Exception as e:  # noqa: BLE001 — 兜底:服务端 bug 不得伪装成断连
                 import logging
-                logging.getLogger("coordinator").exception("handle_report 内部错误")
+                logging.getLogger("coordinator").exception("do_POST 内部错误")
                 self._json(500, {"error": f"内部错误: {e}"})
 
         def log_message(self, fmt, *args):  # 安静模式:交给 logging
             pass
 
     return Handler
+
+
+class InvalidIngest(ValueError):
+    """ingest 请求字段缺失或非法。"""
+
+
+def _handle_ingest(co: Coordinator, event: dict) -> dict:
+    """v1.2 固定动作 1:消息接入(幂等)。
+
+    类型/标题此刻未知 → PENDING 占位、received 状态;由 /route 回填并派单。
+    event_id 由 message_id 确定性派生:重试同一消息只算一次。
+    """
+    message_id = str(event.get("message_id") or "").strip()
+    text = str(event.get("text") or "").strip()
+    if not message_id:
+        raise InvalidIngest("缺少 message_id")
+    if not text:
+        raise InvalidIngest("缺少 text")
+    r = co.ingest_task(
+        event_id=f"msg:{message_id}",
+        message_id=message_id,
+        text=text,
+        task_type="PENDING",
+        title=text[:60],
+        thread_chat_id=event.get("chat_id") or None,
+        thread_root_msg_id=event.get("root_msg_id") or None,
+        allow_placeholder_type=True,
+    )
+    return {"ok": True, "taskid": r.taskid, "duplicate": not r.new}
 
 
 def _list_tasks(co: Coordinator, status: str | None):
