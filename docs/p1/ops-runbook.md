@@ -23,6 +23,36 @@
 3. `systemctl --user start sa-coordinator sa-comment-watcher` → `/healthz` 断言
 4. 回滚 = `git reset --hard <旧版>` + 还原两个 env + 重启;生产库改动均为加法,无需回滚
 
+## Router fastpath 部署/回滚
+
+### 部署顺序
+
+1. 在 `sa.env` 配置 `SA_LLM_BASE_URL=https://api.deepseek.com`、`SA_LLM_MODEL=deepseek-flash`、`SA_LLM_KEY`(只写现场 600 文件,禁止入库/打印)。
+2. 复制 `systemd/im-watcher.env.example` 为 `~/.config/super-agent/im-watcher.env`,填控制会话 chat_id 与 sa-router bot open_id;cursor 默认 `registry/im_watcher_cursor.json`。
+3. 安装 `sa-im-watcher.service`,`systemctl --user daemon-reload`;先 `systemctl --user restart sa-coordinator`,并断言 `curl -fsS http://127.0.0.1:8787/healthz` 返回 `{"ok":true}`。
+4. 再 `systemctl --user enable --now sa-im-watcher`;检查首轮 cursor 从当前时间创建,不得回放历史私聊。
+5. 真机顺序:新任务 → Get → 结论卡(awaiting_go,无 dispatch)→ 对应 thread A 回「开工」→ running + 原生 text 种子。旧 `/route` 同样只能到 awaiting_go。
+
+### 回滚顺序
+
+1. `systemctl --user stop sa-im-watcher`,停止新消息进入;处理完或确认放弃所有 awaiting_go 任务。
+2. 如需保留待路由任务,先停 sa-coordinator,再显式把 awaiting_go 迁回 received(仅在 unit 停止后执行):
+
+```bash
+python3 - <<'PY'
+import sqlite3
+from datetime import datetime, timezone
+conn = sqlite3.connect('registry/tasks.db')
+now = datetime.now(timezone.utc).isoformat()
+conn.execute("UPDATE tasks SET status='received', version=version+1, updated_at=? WHERE status='awaiting_go'", (now,))
+print(f'migrated awaiting_go→received: {conn.total_changes}')
+conn.commit()
+PY
+```
+
+3. 切回旧代码、还原旧 env,再启动 sa-coordinator。**禁止携带 awaiting_go 直接回滚**:旧状态机不认识该状态,旧 `/route` 也无法处理。
+4. 注意:真正回滚到旧代码会恢复旧 `/route` 自动派单语义,仅可作为故障回退并由运维接管;不得把它当作正常入口。
+
 ## 已知噪音/遗留
 
 - 任务 20261115-001(用户撤回消息产生)停 clarifying,Watchdog 每 30min 记日志告警,无功能影响。
