@@ -28,18 +28,31 @@
 
 ## 配额实测口径
 
-当前文档有 2 张评论卡片,每轮调用:
+~~当前文档有 2 张评论卡片,每轮调用:1 次 list_comments + 2 次 list_replies,即 3 次/轮。~~ **已于 2026-11-15 优化为稳态 1 次/轮/文档**,见下节。
 
-- 1 次 `list_comments`
-- 2 次 `list_replies`
+### 频控实测(2026-11-15)
 
-即 **3 次/轮**。一般公式为 `1 + 评论卡片数`。在 3 秒活动间隔下,该文档约 60 次/分钟、**86,400 次/天**;15 秒约 17,280 次/天;60 秒空闲间隔约 4,320 次/天。多文档按活动目标数累加。
+用本文档对 lark-cli 所在应用(cli_aa41c9f9c5789cbc)做了两组突发:
 
-本轮未获得租户限额或 rate-limit 响应头,不能宣称配额充足。生产启用前应确认限额;必要时用 `--active-interval 15`(或更大)并保留指数退避。
+- 串行 40 连发(list-comments/list-replies 交替):40 ok / 0 err,约 0.8 调/s(lark-cli 进程启动约 1.3s/次,是瓶颈而非服务端)。
+- 20 并发 × 40 连发:40 ok / 0 err,峰值约 6.1 调/s,无 429。
+
+结论:1 QPS 量级的轮询远未触服务端频控;官方文档站为 SPA 抓不到正文,租户级每日总量上限仍未拿到书面数字,不宣称"配额充足",但已无硬限流证据。
+
+### 稳态优化:list 签名跳过(2026-11-15)
+
+实测确认 `list-comments` 内嵌 `reply_list.replies` 与 `list-replies` 详情**完全一致**(1=1、3=3、无截断,`--need-reaction` 下含 reactions)。据此实现:
+
+- 每轮固定 1 次 list(含分页);对每条评论计算签名(comment update_time / is_solved / solver / 作者 / 卡片 reaction 数 / 内嵌回复的 reply_id+update_time+reaction 数)。
+- 签名与上轮一致 → 跳过该评论的全部 detail 调用;任一变化才展开对应评论。
+- detail 展开发现比内嵌更多的回复 → 标记 unstable,此后每轮必展开(防御截断)。
+- state 为进程内存;重启后首轮全量展开一次,notify 去重仍由 comment_inbox 兜底。
+
+调用口径:**首/变化轮 `1 + 变化评论数`,稳态 1 次/轮/文档**。3 秒间隔单文档 28,800 次/天(原 86,400);15 秒 5,760 次/天。反应性不降:任何编辑/新回复/解决/点赞都会改变签名并在下一轮(≤3s)被展开。
 
 ## 验证
 
 ```text
-tests/test_comment_watcher.py:14 passed
-全量套件:141 passed
+tests/test_comment_watcher.py:19 passed(新增稳态跳过 4 例)
+全量套件:145 passed(修复 5 处跨 UTC 日硬编码日期断言后)
 ```

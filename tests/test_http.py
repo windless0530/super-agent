@@ -181,7 +181,8 @@ class TestServeWatchdog:
                 startup_now="2999-01-01T00:00:00",
             )
             try:
-                assert any("20261114-001" in r.message for r in caplog.records)
+                from tests.test_coordinator import _utc_today
+                assert any(f"{_utc_today()}-001" in r.message for r in caplog.records)
             finally:
                 th.join(timeout=5)
 

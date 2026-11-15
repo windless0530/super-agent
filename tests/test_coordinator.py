@@ -1,11 +1,17 @@
 """coordinator 核心测试:接入去重、派单、report 主线、决策转发、崩溃收敛。"""
 
 import pytest
+from datetime import datetime, timezone
 
 from services.coordinator import db
 from services.coordinator.coordinator import Coordinator, IngestResult
 from services.coordinator.registry import get_task
 from services.coordinator.sender import AmbiguousSendError, SendError
+
+
+def _utc_today() -> str:
+    """与 registry._now 同源的日期前缀,避免硬编码日期在跨 UTC 日后失效。"""
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
 
 ROUTER_CHAT = "oc_router"
 
@@ -74,7 +80,7 @@ class TestIngest:
         r = _ingest(co)
         assert isinstance(r, IngestResult)
         assert r.new is True
-        assert r.taskid == "20261114-001"
+        assert r.taskid == f"{_utc_today()}-001"
         assert len(sender.reactions) == 1
         assert sender.reactions[0]["emoji"] == "Get"
         t = get_task(conn, r.taskid)
@@ -99,7 +105,7 @@ class TestIngest:
         conn.commit()
         r = _ingest(co)
         assert r.new is True
-        assert r.taskid == "20261114-001"
+        assert r.taskid == f"{_utc_today()}-001"
 
 
 class TestDispatch:

@@ -30,10 +30,9 @@ class FakeReader:
 
     def get_comment(self, doc_token, comment_id, page_token=None):
         if comment_id == "com_1":
+            # 对齐线上语义:detail 的 replies 不含根回复(根即评论卡片)
             return {
                 "replies": [
-                    {"reply_id": "rep_1", "user_id": "ou_bot_design",
-                     "content": "收到,已补充", "update_time": "2026-11-14T01:00:00"},
                     {"reply_id": "rep_2", "user_id": "ou_elio",
                      "content": "重连次数上限?", "update_time": "2026-11-14T02:00:00"},
                     {"reply_id": "rep_3", "user_id": "ou_bot_design",
@@ -250,7 +249,126 @@ class TestMainBotIds:
         assert docs() == []
 
 
-class TestLiveApiContract:
+class TestSteadyStateSkip:
+    """配额优化:list 载荷无变化时跳过 detail 展开,稳态 1 次调用/轮/文档。"""
+
+    def _state(self):
+        return {"sigs": {}, "unstable": set()}
+
+    def test_unchanged_second_round_skips_detail_calls(self, env):
+        conn, taskid = env
+        calls = {"list": 0, "get": 0}
+
+        class CountingReader(FakeReader):
+            def list_comments(self, doc_token, page_token=None):
+                calls["list"] += 1
+                return super().list_comments(doc_token, page_token)
+
+            def get_comment(self, doc_token, comment_id, page_token=None):
+                calls["get"] += 1
+                return super().get_comment(doc_token, comment_id, page_token)
+
+        reader = CountingReader()
+        state = self._state()
+        sync_doc(conn, reader, doc_token="docx_1", taskid=taskid,
+                 bot_ids=BOT_IDS, state=state)
+        first_get = calls["get"]
+        assert first_get > 0
+        assert sync_doc(conn, reader, doc_token="docx_1", taskid=taskid,
+                        bot_ids=BOT_IDS, state=state) == 0
+        # 第二轮 list 照常分页,但 detail 全部跳过
+        assert calls["list"] == 4  # 每轮 2 页 × 2 轮
+        assert calls["get"] == first_get
+
+    def test_changed_comment_expands_only_it(self, env):
+        conn, taskid = env
+        expanded = []
+
+        class MutableReader(FakeReader):
+            mutate = False
+
+            def list_comments(self, doc_token, page_token=None):
+                page = super().list_comments(doc_token, page_token)
+                if self.mutate:
+                    for item in page.get("data", {}).get("items", []):
+                        if item["comment_id"] == "com_1":
+                            for r in (item.get("reply_list") or {}).get("replies", []):
+                                if r.get("reply_id") == "rep_2":
+                                    r["update_time"] = "2026-11-14T09:00:00"
+                return page
+
+            def get_comment(self, doc_token, comment_id, page_token=None):
+                expanded.append(comment_id)
+                return super().get_comment(doc_token, comment_id, page_token)
+
+        reader = MutableReader()
+        state = self._state()
+        sync_doc(conn, reader, doc_token="docx_1", taskid=taskid,
+                 bot_ids=BOT_IDS, state=state)
+        reader.mutate = True
+        expanded.clear()
+        sync_doc(conn, reader, doc_token="docx_1", taskid=taskid,
+                 bot_ids=BOT_IDS, state=state)
+        assert expanded == ["com_1"]
+
+    def test_truncated_comment_always_expanded(self, env):
+        conn, taskid = env
+        expanded = []
+
+        class TruncatingReader(FakeReader):
+            def get_comment(self, doc_token, comment_id, page_token=None):
+                expanded.append(comment_id)
+                result = super().get_comment(doc_token, comment_id, page_token)
+                if comment_id == "com_1" and page_token is None:
+                    # detail 首页带回 3 条回复,但 list 只内嵌了 2 条 → 截断
+                    pass
+                return result
+
+            def list_comments(self, doc_token, page_token=None):
+                page = super().list_comments(doc_token, page_token)
+                for item in page.get("data", {}).get("items", []):
+                    if item["comment_id"] == "com_1":
+                        replies = (item.get("reply_list") or {}).get("replies", [])
+                        item["reply_list"] = {"replies": replies[:1]}
+                return page
+
+        reader = TruncatingReader()
+        state = self._state()
+        sync_doc(conn, reader, doc_token="docx_1", taskid=taskid,
+                 bot_ids=BOT_IDS, state=state)
+        expanded.clear()
+        sync_doc(conn, reader, doc_token="docx_1", taskid=taskid,
+                 bot_ids=BOT_IDS, state=state)
+        # 截断过的评论不可信任签名,必须持续展开
+        assert "com_1" in expanded
+
+    def test_watch_loop_passes_state_across_rounds(self, env):
+        import threading
+        from tools.comment_watcher import watch_loop
+        conn, taskid = env
+        calls = {"get": 0}
+
+        class CountingReader(FakeReader):
+            def get_comment(self, doc_token, comment_id, page_token=None):
+                calls["get"] += 1
+                return super().get_comment(doc_token, comment_id, page_token)
+
+        rounds = iter([1, 1])
+        stop = threading.Event()
+        snapshots = []
+
+        def docs():
+            snapshots.append(calls["get"])  # 每轮开始时抓快照
+            return [{"doc_token": "docx_1", "taskid": taskid, "bot_ids": BOT_IDS}]
+
+        watch_loop(conn, CountingReader(), docs, active_interval=0, idle_interval=0,
+                   stop=stop, max_rounds=lambda: next(rounds, 0))
+        after_round1 = snapshots[1]
+        assert after_round1 > 0                    # 第一轮做了 detail 展开
+        assert calls["get"] == after_round1        # 第二轮未新增 detail 调用
+
+
+
     """P0 #8:lark-cli 1.0.97 的真实命令与 Drive 评论响应结构。"""
 
     ROOT = {

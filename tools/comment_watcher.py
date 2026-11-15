@@ -189,15 +189,57 @@ def _emit_notify(conn, taskid: str, text: str) -> None:
     )
 
 
-def _walk_comments(reader: CommentReader, doc_token: str):
-    """展开评论分页与每条评论的 reply 分页;返回 [(comment, replies, meta)]。"""
+def _comment_signature(item: dict) -> tuple:
+    """评论级变化信号:list 载荷里能看到的全部会变字段。
+
+    含卡片本体(update_time/is_solved/solver/作者)、卡片 reaction 数、
+    内嵌回复的 (reply_id, update_time, reaction 数)。编辑、新回复、
+    解决状态、点赞任一变化都会改变签名。
+    """
+    replies = (item.get("reply_list") or {}).get("replies", []) or []
+    return (
+        item.get("comment_id"),
+        str(item.get("update_time") or ""),
+        item.get("is_solved"),
+        item.get("solver_user_id"),
+        item.get("user_id"),
+        len(item.get("reactions", []) or []),
+        tuple(
+            (r.get("reply_id"), str(r.get("update_time") or ""),
+             len(r.get("reactions") or []))
+            for r in replies
+        ),
+    )
+
+
+def _walk_comments(reader: CommentReader, doc_token: str, state: dict | None = None):
+    """展开评论分页与每条评论的 reply 分页;返回 [(comment, replies, meta)]。
+
+    state 非空时启用稳态跳过:签名与上轮一致且未标记截断的评论,
+    不再调用 detail 接口(每轮 1 次 list 调用/文档)。
+    detail 展开后发现比内嵌更多的回复 → 标记 unstable,永久展开。
+    """
     results = []
     page_token = None
     while True:
         page = reader.list_comments(doc_token, page_token)
         data = page.get("data", page)
         for item in data.get("items", []):
+            cid = item["comment_id"]
+            if state is not None:
+                sig = _comment_signature(item)
+                if (state.get("sigs", {}).get(cid) == sig
+                        and cid not in state.get("unstable", set())):
+                    continue
             replies, meta = _all_replies(reader, doc_token, item)
+            if state is not None:
+                state.setdefault("sigs", {})[cid] = sig
+                embedded = len((item.get("reply_list") or {}).get("replies", []) or [])
+                # 内嵌含根回复、detail 的 replies 不含根:detail 更多即截断。
+                if len(replies) > max(embedded - 1, 0):
+                    state.setdefault("unstable", set()).add(cid)
+                else:
+                    state.get("unstable", set()).discard(cid)
             results.append((item, replies, meta))
         if not data.get("has_more"):
             break
@@ -237,15 +279,20 @@ def sync_doc(
     doc_token: str,
     taskid: str,
     bot_ids: tuple[str, ...],
+    state: dict | None = None,
 ) -> int:
-    """同步一篇文档的评论;返回新增 notify 条数(去重后用户侧新内容)。"""
+    """同步一篇文档的评论;返回新增 notify 条数(去重后用户侧新内容)。
+
+    state 为 {"sigs": {...}, "unstable": set()};传 None 每轮全量展开(旧行为)。
+    无话题锚点时不动 state:锚点补齐后首轮仍全量,去重由 comment_inbox 兜底。
+    """
     task = get_task(conn, taskid)
     if task is None or not task.group_chat_id or not task.topic_root_msg_id:
         # 不消费评论:锚点补齐后下轮仍能通知,避免 _record 后永久去重吞掉。
         logger.warning("任务 %s 无话题锚点,本轮评论暂不同步", taskid)
         return 0
     notified = 0
-    for item, replies, meta in _walk_comments(reader, doc_token):
+    for item, replies, meta in _walk_comments(reader, doc_token, state):
         comment_id = item["comment_id"]
         author = item.get("user_id", "")
         content = item.get("content", "")
@@ -305,11 +352,14 @@ def watch_loop(
     """
     stop = stop or threading.Event()
     backoff = 1.0
+    states: dict[str, dict] = {}
     while not stop.is_set():
         try:
             targets = docs()
             for d in targets:
-                sync_doc(conn, reader, **d)
+                st = states.setdefault(
+                    d["doc_token"], {"sigs": {}, "unstable": set()})
+                sync_doc(conn, reader, **d, state=st)
             backoff = 1.0
             interval = active_interval if targets else idle_interval
         except Exception:  # noqa: BLE001

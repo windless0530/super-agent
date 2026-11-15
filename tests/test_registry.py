@@ -1,10 +1,16 @@
 """registry 模块测试:taskid 分配、建任务、CAS 更新、决策追加、并发。"""
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
 from services.coordinator import db, registry
+
+
+def _utc_today() -> str:
+    """与 registry._now 同源的日期前缀,避免硬编码日期在跨 UTC 日后失效。"""
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
 from services.coordinator.state import InvalidTransition
 from services.coordinator.registry import (
     StaleVersion,
@@ -50,8 +56,9 @@ class TestAllocateTaskid:
         assert allocate_taskid(conn, "20261114") == "20261114-001"
 
     def test_continues_after_real_task_created(self, conn):
-        _mk(conn)  # 创建真实任务占 20261114-001
-        assert allocate_taskid(conn, "20261114") == "20261114-002"
+        today = _utc_today()
+        _mk(conn)  # 创建真实任务占 {today}-001
+        assert allocate_taskid(conn, today) == f"{today}-002"
 
     def test_concurrent_allocation_no_duplicate(self, conn):
         # 两个连接同日各分配 10 次,结果互不重复
@@ -66,7 +73,7 @@ class TestAllocateTaskid:
 class TestCreateTask:
     def test_creates_with_defaults(self, conn):
         t = _mk(conn)
-        assert t.taskid == "20261114-001"
+        assert t.taskid == f"{_utc_today()}-001"
         assert t.status == "received"
         assert t.version == 0
         assert t.doc_links == []
