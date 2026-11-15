@@ -58,6 +58,14 @@ class ClarifyRejected(Exception):
         super().__init__(str(body))
 
 
+class ConfirmRejected(Exception):
+    """确认派单被确定性拒绝(任务不在 awaiting_go 或配置不完整)。"""
+
+    def __init__(self, body: dict):
+        self.body = body
+        super().__init__(str(body))
+
+
 class ReportRejected(Exception):
     """report 被确定性拒绝(如任务非 running);body 携带原因。"""
 
@@ -165,6 +173,58 @@ class Coordinator:
             },
             commit=commit,
         )
+
+    def confirm_task(self, taskid: str) -> dict:
+        """awaiting_go → running + dispatch 入队;唯一允许新派单的入口。"""
+        import json
+        from .context import task_context
+        from .seed import render_seed
+
+        task = get_task(self.conn, taskid)
+        if task is None:
+            raise TaskNotFound(taskid)
+        if task.status == "running":
+            existing = self.conn.execute(
+                "SELECT 1 FROM outbox WHERE taskid=? AND kind='dispatch'", (taskid,)
+            ).fetchone()
+            if existing:
+                return {"ok": True, "taskid": taskid,
+                        "state": "running", "duplicate": True}
+        if task.status != "awaiting_go":
+            raise ConfirmRejected({"ok": False, "reason": "not_awaiting_go",
+                                   "status": task.status})
+        trow = self.conn.execute(
+            "SELECT name, group_chat_id, roles, rounds_limit FROM task_types"
+            " WHERE type_code=? AND enabled=1", (task.type,),
+        ).fetchone()
+        if trow is None or not trow["group_chat_id"]:
+            raise ConfirmRejected({"ok": False, "reason": "group_not_configured",
+                                   "type": task.type})
+        roles = json.loads(trow["roles"])
+        mention_rows = {
+            r["role"]: r["mention"]
+            for r in self.conn.execute("SELECT role, mention FROM role_members")
+        }
+        mentions = tuple(mention_rows.get(role, role) for role in roles)
+        try:
+            cas_update(self.conn, taskid, task.version,
+                       status="running", commit=False)
+            self.dispatch(
+                taskid,
+                seed_text=render_seed(
+                    taskid=taskid, title=task.title, type_name=trow["name"],
+                    roles=roles, rounds_limit=trow["rounds_limit"],
+                    brief=task_context(self.conn, taskid),
+                ),
+                mentions=mentions,
+                commit=False,
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return {"ok": True, "taskid": taskid,
+                "state": "running", "duplicate": False}
 
     # ---------- report ----------
 

@@ -60,6 +60,8 @@ def test_clarified_returns_task_to_received(server):
         "taskid": taskid, "ambiguous": False,
         "task_type": "RD", "title": "支付重连方案调研",
     })
+    assert status == 200 and body["state"] == "awaiting_go"
+    status, body = _post(url, "/confirm", {"taskid": taskid})
     assert status == 200 and body["state"] == "running"
 
 

@@ -146,6 +146,21 @@ def cmd_route(args) -> int:
     return 0
 
 
+def cmd_confirm(args) -> int:
+    """确认 awaiting_go 任务并派单;重复确认幂等。"""
+    url = _base_url(args.url) + "/confirm"
+    try:
+        status, resp = _post(url, {"taskid": args.taskid})
+    except Exception as e:  # noqa: BLE001
+        print(f"sactl: 不可达 {url}: {e}", file=sys.stderr)
+        return 4
+    if status in (422, 409):
+        print(f"sactl: 被拒绝: {resp.get('error') or resp.get('reason')}", file=sys.stderr)
+        return 3
+    print(json.dumps(resp, ensure_ascii=False))
+    return 0
+
+
 def _types_conn(db_path: str | None):
     import os
     import sqlite3
@@ -265,6 +280,11 @@ def main(argv=None) -> int:
                    help="verdict JSON 对象;传 - 从 stdin 读")
     p.add_argument("--url")
     p.set_defaults(func=cmd_route)
+
+    p = sub.add_parser("confirm", help="确认 awaiting_go 任务并派单")
+    p.add_argument("--taskid", required=True)
+    p.add_argument("--url")
+    p.set_defaults(func=cmd_confirm)
 
     p = sub.add_parser("clarified", help="澄清答复上报(可再路由或转新任务)")
     p.add_argument("--taskid", required=True)

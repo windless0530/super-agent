@@ -26,9 +26,19 @@ def test_illegal_transitions_rejected():
         ("clarifying", "done"),
         ("received", "report_pending"),
         ("report_pending", "clarifying"),
+        ("awaiting_go", "done"),
     ]:
         with pytest.raises(InvalidTransition):
             validate_transition(*pair)
+
+
+def test_awaiting_go_transitions():
+    for pair in (("received", "awaiting_go"),
+                 ("awaiting_go", "received"),
+                 ("awaiting_go", "running")):
+        validate_transition(*pair)
+    with pytest.raises(InvalidTransition):
+        validate_transition("awaiting_go", "awaiting_go")
 
 
 def test_same_status_rejected():
@@ -46,7 +56,7 @@ def test_unknown_status_rejected():
 def test_is_terminal():
     assert is_terminal("done") is True
     assert TERMINAL == {"done"}
-    for s in ("received", "clarifying", "running", "report_pending", "awaiting_decision"):
+    for s in ("received", "clarifying", "awaiting_go", "running", "report_pending", "awaiting_decision"):
         assert is_terminal(s) is False
 
 

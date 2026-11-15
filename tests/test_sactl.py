@@ -271,6 +271,24 @@ class TestRoute:
         assert code == 2
 
 
+class TestConfirm:
+    def test_confirm_posts_taskid_and_prints_response(self, monkeypatch, capsys):
+        fake = URLOk([FakeResponse(200, {
+            "ok": True, "taskid": "t-1", "state": "running", "duplicate": False,
+        })])
+        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        code = sactl.main(["confirm", "--taskid", "t-1"])
+        assert code == 0
+        assert fake.requests[0]["url"].endswith("/confirm")
+        assert fake.requests[0]["body"] == {"taskid": "t-1"}
+        assert json.loads(capsys.readouterr().out)["state"] == "running"
+
+    def test_confirm_rejection_exit3(self, monkeypatch):
+        fake = URLOk([FakeResponse(409, {"reason": "not_awaiting_go"})])
+        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        assert sactl.main(["confirm", "--taskid", "t-1"]) == 3
+
+
 class TestClarified:
     """clarified 子命令:澄清答复上报。"""
 

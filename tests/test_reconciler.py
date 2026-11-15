@@ -111,6 +111,20 @@ class TestReviewFixes:
         assert len(sender.replies) == before  # 补迁移不重复回投
         assert report.resent == 0
 
+    def test_awaiting_go_uses_24h_threshold(self, env):
+        conn, sender, co = env
+        from services.coordinator.reconciler import scan_stuck
+        from services.coordinator.registry import cas_update, get_task
+        r = co.ingest_task(event_id="ev_go", message_id="om_go", text="t",
+                           task_type="RD", title="A")
+        cas_update(conn, r.taskid, get_task(conn, r.taskid).version,
+                   status="awaiting_go")
+        conn.execute("UPDATE tasks SET updated_at='2000-01-01T00:00:00+00:00'")
+        conn.commit()
+        assert scan_stuck(conn, "2000-01-01T23:00:00+00:00") == []
+        stuck = scan_stuck(conn, "2000-01-02T01:00:01+00:00")
+        assert [s["taskid"] for s in stuck] == [r.taskid]
+
     def test_received_and_clarifying_stuck_detected(self, env):
         conn, sender, co = env
         r1 = co.ingest_task(event_id="ev_1", message_id="om_1", text="t",

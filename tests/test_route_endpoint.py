@@ -41,19 +41,28 @@ def _post(url, path, body):
         return e.code, json.loads(e.read())
 
 
-def test_route_full_verdict_dispatches(server):
+def test_route_full_verdict_waits_for_confirm_before_dispatch(server):
     url, co, sender, taskid = server
     status, body = _post(url, "/route", {
         "taskid": taskid, "ambiguous": False,
         "task_type": "RD", "title": "支付网关重连方案调研",
     })
     assert status == 200
-    assert body == {"ok": True, "taskid": taskid, "state": "running"}
+    assert body == {"ok": True, "taskid": taskid, "state": "awaiting_go"}
     task = co.conn.execute("SELECT * FROM tasks WHERE taskid=?", (taskid,)).fetchone()
-    assert task["status"] == "running"
+    assert task["status"] == "awaiting_go"
     assert task["type"] == "RD" and task["title"] == "支付网关重连方案调研"
+    kinds = [r[0] for r in co.conn.execute(
+        "SELECT kind FROM outbox WHERE taskid=?", (taskid,))]
+    assert kinds == ["relay"]
     co.process_due_outbox()
-    assert sender.top_level, "种子消息应已发出"
+    assert not sender.top_level
+    assert "在本话题回**开工**派单" in sender.replies[0]["text"]
+
+    status, confirmed = _post(url, "/confirm", {"taskid": taskid})
+    assert status == 200 and confirmed["state"] == "running"
+    co.process_due_outbox()
+    assert sender.top_level, "确认后种子消息应已发出"
     seed = sender.top_level[0]
     assert seed["chat_id"] == "oc_g"
     assert f"[{taskid}] 支付网关重连方案调研" in seed["text"]
@@ -70,6 +79,7 @@ def test_route_role_members_override_mentions(server):
     co.conn.commit()
     _post(url, "/route", {"taskid": taskid, "ambiguous": False,
                           "task_type": "RD", "title": "T"})
+    _post(url, "/confirm", {"taskid": taskid})
     co.process_due_outbox()
     assert sender.top_level
     assert sender.top_level[0]["mentions"] == ("ou_d1:sa-design", "ou_r1:sa-review")
@@ -174,16 +184,18 @@ class TestRouteFixPass:
         url, co, _, taskid = server
         from services.coordinator.coordinator import Coordinator
 
-        def boom(self, taskid, *, seed_text, mentions):
+        _post(url, "/route", {"taskid": taskid, "ambiguous": False,
+                              "task_type": "RD", "title": "T"})
+
+        def boom(self, taskid, *, seed_text, mentions, commit=True):
             raise RuntimeError("kill -9 模拟:dispatch 前崩溃")
 
         monkeypatch.setattr(Coordinator, "dispatch", boom)
-        status, body = _post(url, "/route", {"taskid": taskid, "ambiguous": False,
-                                             "task_type": "RD", "title": "T"})
+        status, body = _post(url, "/confirm", {"taskid": taskid})
         assert status == 500
         row = self._row(co, taskid)
-        assert row["status"] == "received"  # CAS 已回滚,不得停留在 running
-        assert row["type"] == "PENDING" and row["title"] != "T"
+        assert row["status"] == "awaiting_go"  # CAS 已回滚,不得停留在 running
+        assert row["type"] == "RD" and row["title"] == "T"
         assert co.conn.execute(
-            "SELECT COUNT(*) c FROM outbox WHERE taskid=?", (taskid,)
+            "SELECT COUNT(*) c FROM outbox WHERE taskid=? AND kind='dispatch'", (taskid,)
         ).fetchone()["c"] == 0

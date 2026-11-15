@@ -6,6 +6,23 @@
 PLACEHOLDER_BRIEF = "任务简报:见 thread A 原文(本次路由未携带简报,以用户原话为准)。"
 
 
+def render_verdict(
+    taskid: str,
+    title: str,
+    type_name: str,
+    roles: tuple[str, ...] | list[str],
+    rounds_limit: int,
+    context: str,
+) -> str:
+    """结论卡:理解、执行计划与唯一的派单确认指令。"""
+    return (
+        f"[{taskid}] {type_name} · {title}\n"
+        f"我的理解:\n{context}\n"
+        f"执行计划:{' → '.join(roles)};评审轮数上限 {rounds_limit}。\n"
+        "在本话题回**开工**派单;要改直接说"
+    )
+
+
 def render_seed(
     taskid: str,
     title: str,

@@ -19,6 +19,7 @@ from . import outbox
 _THRESHOLDS = {
     "received": timedelta(minutes=30),
     "clarifying": timedelta(minutes=30),
+    "awaiting_go": timedelta(hours=24),
     "running": timedelta(hours=4),
     "report_pending": timedelta(minutes=10),
     "awaiting_decision": timedelta(hours=24),

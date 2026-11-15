@@ -15,9 +15,10 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import db
+from . import db, outbox
 from .coordinator import (
     ClarifyRejected,
+    ConfirmRejected,
     Coordinator,
     InvalidClarified,
     ReportRejected,
@@ -85,7 +86,7 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
 
         def do_POST(self):  # noqa: N802
             path = urlparse(self.path).path
-            if path not in ("/report", "/ingest", "/route", "/clarified"):
+            if path not in ("/report", "/ingest", "/route", "/clarified", "/confirm"):
                 self._json(404, {"error": "not found"})
                 return
             try:
@@ -102,6 +103,8 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
                         body = _handle_route(co, event)
                     elif path == "/clarified":
                         body = co.handle_clarified(event)
+                    elif path == "/confirm":
+                        body = _handle_confirm(co, event)
                     else:
                         body = co.handle_report(event)
                 self._json(200, body)
@@ -109,7 +112,7 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
                 self._json(422, {"error": str(e)})
             except TaskNotFound as e:
                 self._json(422, {"error": f"任务不存在: {e}"})
-            except (ReportRejected, RouteRejected, ClarifyRejected) as e:
+            except (ReportRejected, RouteRejected, ClarifyRejected, ConfirmRejected) as e:
                 self._json(409, e.body)
             except (InvalidTransition, StaleVersion) as e:
                 self._json(409, {"ok": False, "reason": "state_conflict",
@@ -191,37 +194,33 @@ def _handle_route(co: Coordinator, event: dict) -> dict:
         roles = _json.loads(trow["roles"])
     except ValueError as e:
         raise InvalidRoute(f"类型注册表 roles 损坏: {task_type} ({e})") from e
-    mention_rows = {
-        r["role"]: r["mention"]
-        for r in co.conn.execute("SELECT role, mention FROM role_members")
-    }
-    mentions = tuple(mention_rows.get(role, role) for role in roles)
-
+    from .context import task_context
     from .registry import cas_update
-    from .seed import render_seed
-    brief_row = co.conn.execute(
-        "SELECT payload FROM inbox_events WHERE taskid=? AND kind='task'"
-        " ORDER BY received_at LIMIT 1", (taskid,),
-    ).fetchone()
-    brief = ""
-    if brief_row is not None:
-        try:
-            brief = str((_json.loads(brief_row["payload"]) or {}).get("text") or "")
-        except (ValueError, TypeError):
-            brief = ""
-    # CAS 与 dispatch 入队同一事务:dispatch 前崩溃不留下 running 无种子的任务
+    from .seed import render_verdict
+    # 明确 verdict 只出结论卡;dispatch 统一留到 /confirm。
     try:
-        cas_update(co.conn, taskid, task["version"],
-                   type=task_type, title=title, status="running", commit=False)
-        co.dispatch(taskid, seed_text=render_seed(
-            taskid=taskid, title=title, type_name=trow["name"],
-            roles=roles, rounds_limit=trow["rounds_limit"], brief=brief,
-        ), mentions=mentions, commit=False)
+        task = cas_update(co.conn, taskid, task["version"],
+                          type=task_type, title=title, status="awaiting_go",
+                          commit=False)
+        outbox.enqueue(
+            co.conn, taskid=taskid, kind="relay",
+            payload={
+                "chat_id": task.thread_a_chat_id or "",
+                "root": task.thread_a_msg_id,
+                "text": render_verdict(
+                    taskid=taskid, title=title, type_name=trow["name"],
+                    roles=roles, rounds_limit=trow["rounds_limit"],
+                    context=task_context(co.conn, taskid),
+                ),
+                "outcome": None,
+            },
+            commit=False,
+        )
         co.conn.commit()
     except Exception:
         co.conn.rollback()
         raise
-    return {"ok": True, "taskid": taskid, "state": "running"}
+    return {"ok": True, "taskid": taskid, "state": "awaiting_go"}
 
 
 def _handle_ingest(co: Coordinator, event: dict) -> dict:
@@ -247,6 +246,13 @@ def _handle_ingest(co: Coordinator, event: dict) -> dict:
         allow_placeholder_type=True,
     )
     return {"ok": True, "taskid": r.taskid, "duplicate": not r.new}
+
+
+def _handle_confirm(co: Coordinator, event: dict) -> dict:
+    taskid = str(event.get("taskid") or "").strip()
+    if not taskid:
+        raise InvalidIngest("缺少 taskid")
+    return co.confirm_task(taskid)
 
 
 def _list_tasks(co: Coordinator, status: str | None):

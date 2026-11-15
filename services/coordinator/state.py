@@ -12,6 +12,7 @@
 STATUS = {
     "received",
     "clarifying",
+    "awaiting_go",
     "running",
     "report_pending",
     "awaiting_decision",
@@ -21,8 +22,10 @@ STATUS = {
 TERMINAL = {"done"}
 
 TRANSITIONS: dict[str, set[str]] = {
-    "received": {"clarifying", "running"},
+    # received→running 仅保留给旧 dispatch 的崩溃恢复;新派单必须经 awaiting_go。
+    "received": {"clarifying", "awaiting_go", "running"},
     "clarifying": {"received"},
+    "awaiting_go": {"received", "running"},
     "running": {"report_pending"},
     "report_pending": {"running", "done", "awaiting_decision"},
     "awaiting_decision": {"running"},
