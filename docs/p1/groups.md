@@ -1,12 +1,15 @@
 # P1 话题群与成员登记
 
-- 日期:2026-11-15(最终版)
+- 日期:2026-11-15(最终版;router 应用当日换新,见 bot-fleet.md)
 - 结论:两群满员、`chat_mode=topic`、群主=Elio
 
 | 群 | chat_id | bot 成员 | 用户 |
 |---|---|---|---|
-| 调研工场 | **oc_0862450e0a36e1ff8bb9e08ffadf7b18** | sa-router、sa-design-planner、sa-design-reviewer | Elio(owner) |
-| 开发工场 | **oc_a9096dbec0eb96f1fe4706118cbe1f1c** | sa-router、sa-develop-planner、sa-develop-executor、sa-develop-reviewer | Elio(owner) |
+| 调研工场 | **oc_0862450e0a36e1ff8bb9e08ffadf7b18** | sa-router(cli_aa73e35662385c02)、sa-design-planner、sa-design-reviewer | Elio(owner) |
+| 开发工场 | **oc_a9096dbec0eb96f1fe4706118cbe1f1c** | sa-router(cli_aa73e35662385c02)、sa-develop-planner、sa-develop-executor、sa-develop-reviewer | Elio(owner) |
+
+- 2026-11-15 换血:新 sa-router 经 `im chat.members create(app_id)` 加入两群(members-list 验证通过,本次 API 未假成功);老应用 cli_aa561825aab8dbb5 退出两群(用户 `!` 自跑 chat.members delete)。老应用新 open_id 变更未回填(已退出,无需)。
+- **sender 会话**:headless `08e3b041-7adc-481f-b512-870fb1718045`(bot=sa-router 新应用,bind 调研工场;READY 自检过,deepseek-v4-pro 应答),`sa.env` 已切换,冒烟消息发送者验证= sa-router(Task 6 Step 5 完成)。
 
 ## bot open_id(权威来源:群成员列表 member_id;bot 的 open_id 跨 app 稳定)
 
@@ -15,7 +18,8 @@
 
 | app | appId | open_id |
 |---|---|---|
-| sa-router | cli_aa561825aab8dbb5 | ou_baa4e976b84975fa081823a9e7d13941 |
+| sa-router | cli_aa73e35662385c02 | **ou_f219e6996b367770c5c214dc07a8d29e** |
+| ~~sa-router(旧)~~ | cli_aa561825aab8dbb5(=Elio The Archangel,已退出) | ou_baa4e976b84975fa081823a9e7d13941 |
 | sa-design-planner | cli_aa73f547f0f89c1a | ou_3daa13bffceb4619b7ef041913bbc4d2 |
 | sa-design-reviewer | cli_aa73f5dd27f8dbf7 | ou_efd1a7a445edf44720c5a91e83fbe714 |
 | sa-develop-planner | cli_aa73f5c27b39dbf6 | ou_15cd8ac5738acbdf3681d4272a19a159 |
