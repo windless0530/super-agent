@@ -5,3 +5,7 @@ tasks/
 # per-bot 会话级模型凭据(含 ANTHROPIC_AUTH_TOKEN,绝不入库)
 bots/*/.claude/settings.json
 bots/*/.claude/settings.local.json
+
+# 本地 harness 目录(worktree、会话设置),不入库
+.claude/
+.superpowers/
