@@ -28,6 +28,8 @@ from .registry import StaleVersion, TaskNotFound
 from .state import InvalidTransition
 from .reconciler import reconcile, scan_stuck
 from .report import InvalidReport
+from .fastpath import Fastpath, InvalidInbox
+from .llm import VerdictError
 from .sender import LarkCliSender
 
 DEFAULT_DB_PATH = "registry/tasks.db"
@@ -56,8 +58,10 @@ def acquire_lock(lock_path: str) -> int:
     return fd
 
 
-def make_handler(co: Coordinator, lock: threading.Lock | None = None):
+def make_handler(co: Coordinator, lock: threading.Lock | None = None,
+                 verdict=None, wake_outbox=None):
     lock = lock or threading.Lock()
+    fastpath = None
 
     class Handler(BaseHTTPRequestHandler):
         def _json(self, code: int, body: dict):
@@ -67,6 +71,14 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+
+        def _inbox_handler(self):
+            nonlocal fastpath
+            if fastpath is None:
+                from .llm import DeepSeekVerdict
+                fastpath = Fastpath(co, verdict or DeepSeekVerdict(), lock,
+                                    wake_outbox=wake_outbox)
+            return fastpath
 
         def do_GET(self):  # noqa: N802
             parsed = urlparse(self.path)
@@ -86,7 +98,7 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
 
         def do_POST(self):  # noqa: N802
             path = urlparse(self.path).path
-            if path not in ("/report", "/ingest", "/route", "/clarified", "/confirm"):
+            if path not in ("/report", "/ingest", "/route", "/clarified", "/confirm", "/inbox"):
                 self._json(404, {"error": "not found"})
                 return
             try:
@@ -96,20 +108,26 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
                 self._json(422, {"error": f"非法 JSON: {e}"})
                 return
             try:
-                with lock:
-                    if path == "/ingest":
-                        body = _handle_ingest(co, event)
-                    elif path == "/route":
-                        body = _handle_route(co, event)
-                    elif path == "/clarified":
-                        body = co.handle_clarified(event)
-                    elif path == "/confirm":
-                        body = _handle_confirm(co, event)
-                    else:
-                        body = co.handle_report(event)
+                if path == "/inbox":
+                    body = self._inbox_handler().handle(event)
+                else:
+                    with lock:
+                        if path == "/ingest":
+                            body = _handle_ingest(co, event)
+                        elif path == "/route":
+                            body = _handle_route(co, event)
+                        elif path == "/clarified":
+                            body = co.handle_clarified(event)
+                        elif path == "/confirm":
+                            body = _handle_confirm(co, event)
+                        else:
+                            body = co.handle_report(event)
                 self._json(200, body)
-            except (InvalidIngest, InvalidRoute, InvalidClarified, InvalidReport) as e:
+            except (InvalidIngest, InvalidRoute, InvalidClarified, InvalidReport,
+                    InvalidInbox) as e:
                 self._json(422, {"error": str(e)})
+            except VerdictError as e:
+                self._json(503, {"error": str(e)})
             except TaskNotFound as e:
                 self._json(422, {"error": f"任务不存在: {e}"})
             except (ReportRejected, RouteRejected, ClarifyRejected, ConfirmRejected) as e:
@@ -267,11 +285,14 @@ def _list_tasks(co: Coordinator, status: str | None):
 
 
 def serve_in_thread(co: Coordinator, port: int = 8787, ready=None,
-                    startup_now: str | None = None, with_watchdog: bool = True):
+                    startup_now: str | None = None, with_watchdog: bool = True,
+                    verdict=None, wake_outbox=None):
     """测试友好:启动对账 + 线程内起服务,ready(port) 回调通知端口。"""
     if with_watchdog:
         _startup_reconcile_and_log(co, startup_now or utcnow_iso())
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(co))
+    server = ThreadingHTTPServer(("127.0.0.1", port),
+                                 make_handler(co, verdict=verdict,
+                                              wake_outbox=wake_outbox))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     if ready:
@@ -320,8 +341,9 @@ def serve(host: str, port: int, db_path: str) -> None:
     db.seed_task_types(conn)
     co = Coordinator(conn, LarkCliSender())
 
+    outbox_wake = threading.Event()
+
     def poll():
-        import time
         while True:
             try:
                 with poll_lock:
@@ -329,7 +351,8 @@ def serve(host: str, port: int, db_path: str) -> None:
             except Exception:  # noqa: BLE001
                 import logging
                 logging.getLogger("coordinator").exception("outbox 推进异常(继续)")
-            time.sleep(POLL_INTERVAL_SECONDS)
+            outbox_wake.wait(POLL_INTERVAL_SECONDS)
+            outbox_wake.clear()
 
     poll_lock = threading.Lock()
     threading.Thread(target=poll, daemon=True).start()
@@ -341,7 +364,9 @@ def serve(host: str, port: int, db_path: str) -> None:
     ).start()
     print(f"sa-coordinator serving on {host}:{port} (db={db_path})", flush=True)
     try:
-        ThreadingHTTPServer((host, port), make_handler(co, poll_lock)).serve_forever()
+        ThreadingHTTPServer((host, port), make_handler(
+            co, poll_lock, wake_outbox=outbox_wake.set,
+        )).serve_forever()
     finally:
         os.close(lock_fd)
         os.unlink(os.path.join(os.path.dirname(db_path) or ".", "coordinator.lock"))

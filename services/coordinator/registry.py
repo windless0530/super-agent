@@ -87,7 +87,7 @@ class Task:
 _TASK_FIELDS = {f.name for f in fields(Task)}
 
 
-def allocate_taskid(conn: sqlite3.Connection, today: str) -> str:
+def allocate_taskid(conn: sqlite3.Connection, today: str, commit: bool = True) -> str:
     """分配当日序号 taskid(yyyymmdd-NNN),taskid_seq 保留行保证并发唯一。"""
     conn.execute(
         "INSERT OR IGNORE INTO taskid_seq (taskid_date, last) VALUES (?, 0)", (today,)
@@ -100,7 +100,8 @@ def allocate_taskid(conn: sqlite3.Connection, today: str) -> str:
                 (today,),
             )
             row = cur.fetchone()
-            conn.commit()
+            if commit:
+                conn.commit()
             return f"{today}-{row[0]:03d}"
         except sqlite3.OperationalError:
             continue
@@ -135,7 +136,7 @@ def create_task(
     now = _now()
     today = now[:10].replace("-", "")
     # 当日序号(循环防并发冲突,taskid_seq 已保证唯一,此处仅防御)
-    taskid = allocate_taskid(conn, today)
+    taskid = allocate_taskid(conn, today, commit=commit)
     conn.execute(
         "INSERT INTO tasks (taskid, parent_task_id, type, title, thread_a_msg_id,"
         " thread_a_chat_id, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
