@@ -9,6 +9,7 @@
 """
 
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Protocol, runtime_checkable
@@ -86,11 +87,13 @@ class Coordinator:
         sender,
         now: Callable[[], str] = utcnow_iso,
         probe: MsgProbe | None = None,
+        db_lock: threading.Lock | None = None,
     ):
         self.conn = conn
         self.sender = sender
         self.now = now
         self.probe = probe
+        self.db_lock = db_lock or threading.Lock()
 
     # ---------- 接入 ----------
 
@@ -415,54 +418,63 @@ class Coordinator:
     # ---------- outbox 推进 ----------
 
     def process_due_outbox(self, now: str | None = None) -> int:
+        """DB 认领/落库持短锁;probe 与外部发送一律在锁外执行。"""
         now = now or self.now()
+        with self.db_lock:
+            rows = outbox.pending_due(self.conn, now)
         processed = 0
-        for row in outbox.pending_due(self.conn, now):
+        for row in rows:
             payload = row.payload
-            # 每次发送前都会置 needs_reconcile;确定未发出的 SendError 会清除,
-            # 因而只有结果不确定的行才需要 probe,确定失败可安全重试。
-            must_reconcile = row.needs_reconcile
-            if must_reconcile:
+            if row.needs_reconcile:
                 if self.probe is None:
                     # 不变式:无对账手段就不重发(宁可滞留,不可重复话题/回投)
                     logger.error(
                         "outbox 行 %s(task=%s)needs_reconcile 且无 probe,跳过重发,"
                         "待 probe 注入或人工处置", row.id, row.taskid,
                     )
-                    outbox.defer(self.conn, row.id,
-                                 next_retry_at=_plus_seconds(now, RETRY_DELAY_SECONDS))
+                    with self.db_lock:
+                        outbox.defer(
+                            self.conn, row.id,
+                            next_retry_at=_plus_seconds(now, RETRY_DELAY_SECONDS),
+                        )
                     continue
+                # probe 可能访问网络,不得阻塞 HTTP 的数据库锁。
                 found = self.probe.find_seed(payload.get("chat_id", ""), row.taskid)
                 if found:
-                    outbox.mark_sent(self.conn, row.id, found)
-                    self._post_send(row.kind, row.taskid, payload, found)
+                    with self.db_lock:
+                        outbox.mark_sent(self.conn, row.id, found)
+                        self._post_send(row.kind, row.taskid, payload, found)
                     processed += 1
                     continue
-            # 外部调用前先持久化认领:若进程在发送后被 kill,重启看到的是
-            # needs_reconcile 行,必须先对账,不能把 attempts=0 当作从未尝试。
-            if not outbox.mark_inflight(
-                self.conn, row.id, now=now,
-                next_retry_at=_plus_seconds(now, RETRY_DELAY_SECONDS),
-            ):
-                continue  # 已被另一推进者认领
+            # 锁内持久化认领;发送后被 kill 仍会留下 needs_reconcile 行。
+            with self.db_lock:
+                claimed = outbox.mark_inflight(
+                    self.conn, row.id, now=now,
+                    next_retry_at=_plus_seconds(now, RETRY_DELAY_SECONDS),
+                )
+            if not claimed:
+                continue
             try:
                 sent_msg_id = self._send(row.kind, payload)
             except AmbiguousSendError:
-                outbox.mark_failed_attempt(
-                    self.conn, row.id,
-                    next_retry_at=_plus_seconds(now, RETRY_DELAY_SECONDS),
-                    needs_reconcile=True,
-                )
+                with self.db_lock:
+                    outbox.mark_failed_attempt(
+                        self.conn, row.id,
+                        next_retry_at=_plus_seconds(now, RETRY_DELAY_SECONDS),
+                        needs_reconcile=True,
+                    )
                 continue
             except SendError as e:
                 logger.warning("outbox 行 %s 发送失败: %s", row.id, e)
-                outbox.mark_failed_attempt(
-                    self.conn, row.id,
-                    next_retry_at=_plus_seconds(now, RETRY_DELAY_SECONDS),
-                )
+                with self.db_lock:
+                    outbox.mark_failed_attempt(
+                        self.conn, row.id,
+                        next_retry_at=_plus_seconds(now, RETRY_DELAY_SECONDS),
+                    )
                 continue
-            outbox.mark_sent(self.conn, row.id, sent_msg_id)
-            self._post_send(row.kind, row.taskid, payload, sent_msg_id)
+            with self.db_lock:
+                outbox.mark_sent(self.conn, row.id, sent_msg_id)
+                self._post_send(row.kind, row.taskid, payload, sent_msg_id)
             processed += 1
         return processed
 

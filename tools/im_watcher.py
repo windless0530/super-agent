@@ -177,7 +177,7 @@ def sync_once(reader, post, *, chat_id: str, start: str, bot_ids: tuple[str, ...
     if saw_current:
         overlap = max(start_dt, latest - timedelta(seconds=2))
         return overlap.isoformat()
-    return max(start_dt, round_dt).isoformat()
+    return max(start_dt, round_dt - timedelta(seconds=2)).isoformat()
 
 
 def watch_loop(reader, post, *, chat_id, bot_ids, cursor_store,

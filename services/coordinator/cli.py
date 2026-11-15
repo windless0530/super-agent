@@ -291,7 +291,7 @@ def serve_in_thread(co: Coordinator, port: int = 8787, ready=None,
     if with_watchdog:
         _startup_reconcile_and_log(co, startup_now or utcnow_iso())
     server = ThreadingHTTPServer(("127.0.0.1", port),
-                                 make_handler(co, verdict=verdict,
+                                 make_handler(co, lock=co.db_lock, verdict=verdict,
                                               wake_outbox=wake_outbox))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -333,28 +333,29 @@ class _Joinable:
         self._thread.join(timeout=timeout)
 
 
-def serve(host: str, port: int, db_path: str) -> None:
+def serve(host: str, port: int, db_path: str, ready=None,
+          stop_event: threading.Event | None = None, verdict=None) -> None:
     lock_fd = acquire_lock(os.path.join(os.path.dirname(db_path) or ".",
                                         "coordinator.lock"))
     conn = db.connect(db_path)
     db.init_schema(conn)
     db.seed_task_types(conn)
-    co = Coordinator(conn, LarkCliSender())
-
+    poll_lock = threading.Lock()
+    co = Coordinator(conn, LarkCliSender(), db_lock=poll_lock)
+    stop_event = stop_event or threading.Event()
     outbox_wake = threading.Event()
 
     def poll():
-        while True:
+        while not stop_event.is_set():
             try:
-                with poll_lock:
-                    co.process_due_outbox()
+                # process_due_outbox 内部只在 DB 短事务持 poll_lock;发送在锁外。
+                co.process_due_outbox()
             except Exception:  # noqa: BLE001
                 import logging
                 logging.getLogger("coordinator").exception("outbox 推进异常(继续)")
             outbox_wake.wait(POLL_INTERVAL_SECONDS)
             outbox_wake.clear()
 
-    poll_lock = threading.Lock()
     threading.Thread(target=poll, daemon=True).start()
     # 启动对账 + 周期卡死巡检(I6:serve 主运行模式与 once 同等服务面)
     _startup_reconcile_and_log(co, utcnow_iso())
@@ -362,12 +363,25 @@ def serve(host: str, port: int, db_path: str) -> None:
     threading.Thread(
         target=_watchdog_loop, args=(co, watchdog_stop), daemon=True
     ).start()
+    server = ThreadingHTTPServer((host, port), make_handler(
+        co, poll_lock, verdict=verdict, wake_outbox=outbox_wake.set,
+    ))
+    if ready:
+        ready(server.server_address[1])
+
+    def stop_server():
+        stop_event.wait()
+        server.shutdown()
+
+    if stop_event is not None:
+        threading.Thread(target=stop_server, daemon=True).start()
     print(f"sa-coordinator serving on {host}:{port} (db={db_path})", flush=True)
     try:
-        ThreadingHTTPServer((host, port), make_handler(
-            co, poll_lock, wake_outbox=outbox_wake.set,
-        )).serve_forever()
+        server.serve_forever()
     finally:
+        stop_event.set()
+        watchdog_stop.set()
+        server.server_close()
         os.close(lock_fd)
         os.unlink(os.path.join(os.path.dirname(db_path) or ".", "coordinator.lock"))
 

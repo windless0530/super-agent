@@ -158,7 +158,7 @@ def test_sync_skips_pre_cursor_and_empty_round_advances():
         bot_ids=(), round_started=iso_second(30),
     )
     assert posted == []
-    assert cursor == iso_second(30)
+    assert cursor == iso_second(28)  # 空轮也保留 2s 重叠,容忍主机/服务端时钟偏差
 
 
 def test_failed_post_does_not_advance_cursor_and_next_round_retries(tmp_path):

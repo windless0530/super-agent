@@ -10,6 +10,7 @@ import pytest
 from services.coordinator import db
 from services.coordinator.cli import serve_in_thread
 from services.coordinator.coordinator import Coordinator
+from services.coordinator.context import task_context
 from services.coordinator.llm import VerdictError
 from services.coordinator.registry import get_task
 from tests.test_coordinator import FakeSender
@@ -313,3 +314,120 @@ def test_awaiting_go_modification_uses_accumulated_context(server):
     assert task.decisions[-1]["text"] == "补充验收 99%"
     assert verdict.calls[-1]["mode"] == "task"
     assert "澄清/修改 1: 补充验收 99%" in verdict.calls[-1]["context"]
+
+
+def test_duplicate_confirm_retries_when_task_still_awaiting_go(server):
+    url, co, _, _, _ = server
+    _, created = _inbox(url, _event("om_confirm_retry_root"))
+    taskid = created["taskid"]
+    original = co.confirm_task
+
+    def fail_once(taskid):
+        raise RuntimeError("confirm crashed after claim")
+
+    with monkeypatch_context(co, "confirm_task", fail_once):
+        status, _ = _inbox(url, _event("om_confirm_retry", "om_confirm_retry_root", "开工"))
+        assert status == 500
+        assert get_task(co.conn, taskid).status == "awaiting_go"
+
+    status, body = _inbox(url, _event("om_confirm_retry", "om_confirm_retry_root", "开工"))
+    assert status == 200 and body["action"] == "confirm"
+    assert get_task(co.conn, taskid).status == "running"
+    assert co.conn.execute("SELECT COUNT(*) FROM outbox WHERE kind='dispatch'").fetchone()[0] == 1
+
+
+def test_same_thread_modification_and_confirm_are_serialized(server):
+    url, co, _, verdict, _ = server
+    _, created = _inbox(url, _event("om_serial_root"))
+    taskid = created["taskid"]
+    entered = threading.Event()
+    release = threading.Event()
+    original = verdict.decide
+
+    def blocking_verdict(*, mode, context):
+        entered.set()
+        assert release.wait(3)
+        return original(mode=mode, context=context)
+
+    results = {}
+    go_done = threading.Event()
+    with monkeypatch_context(verdict, "decide", blocking_verdict):
+        modify = threading.Thread(target=lambda: results.setdefault(
+            "modify", _inbox(url, _event("om_serial_edit", "om_serial_root", "补充 99%"))))
+        modify.start()
+        assert entered.wait(2)
+
+        def confirm():
+            results["go"] = _inbox(url, _event("om_serial_go", "om_serial_root", "开工"))
+            go_done.set()
+
+        go = threading.Thread(target=confirm)
+        go.start()
+        was_serialized = not go_done.wait(0.3)
+        release.set()
+        modify.join(3)
+        go.join(3)
+
+    assert was_serialized, "开工不得在修改 verdict 尚未完成时提前结束"
+    assert results["modify"][0] == 200
+    assert results["go"][0] == 200 and results["go"][1]["action"] == "confirm"
+    assert get_task(co.conn, taskid).status == "running"
+    assert "补充 99%" in task_context(co.conn, taskid)
+
+
+def test_outbox_send_does_not_block_real_serve_inbox(tmp_path, monkeypatch):
+    from services.coordinator import outbox
+    from services.coordinator.cli import serve
+    import services.coordinator.cli as cli_mod
+
+    db_path = str(tmp_path / "serve.db")
+    conn = db.connect(db_path)
+    db.init_schema(conn)
+    db.seed_task_types(conn)
+    conn.execute("UPDATE task_types SET group_chat_id='oc_g' WHERE type_code='RD'")
+    conn.commit()
+    co = Coordinator(conn, FakeSender())
+    task = co.ingest_task(event_id="ev_send", message_id="om_send", text="send",
+                          task_type="RD", title="Send")
+    taskid = task.taskid
+    conn.close()
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingSender(FakeSender):
+        def send_seed(self, chat_id, text, mentions=()):
+            entered.set()
+            assert release.wait(5)
+            return "om_blocked_seed"
+
+    sender = BlockingSender()
+    monkeypatch.setattr(cli_mod, "LarkCliSender", lambda: sender)
+    stop = threading.Event()
+    ready = threading.Event()
+    holder = {}
+
+    def run_server():
+        serve("127.0.0.1", 0, db_path,
+              ready=lambda port: (holder.__setitem__("port", port), ready.set()),
+              stop_event=stop, verdict=FakeVerdict())
+
+    server_thread = threading.Thread(target=run_server)
+    server_thread.start()
+    try:
+        assert ready.wait(3)
+        conn = db.connect(db_path)
+        outbox.enqueue(conn, taskid=taskid, kind="dispatch", payload={
+            "chat_id": "oc_g", "seed_text": "seed", "mentions": [],
+        })
+        conn.close()
+        assert entered.wait(8)
+        url = f"http://127.0.0.1:{holder['port']}"
+        status, body = _inbox(url, _event("om_during_send"),)
+        assert status == 200 and body["action"] == "ingest"
+        assert any(r["msg_id"] == "om_during_send" for r in sender.reactions)
+    finally:
+        release.set()
+        stop.set()
+        server_thread.join(5)
+    assert not server_thread.is_alive()

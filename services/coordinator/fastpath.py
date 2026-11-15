@@ -1,6 +1,7 @@
 """控制会话快路径:单次 inbox claim、锁外 Get/verdict、thread 级状态分类。"""
 
 import logging
+import threading
 from dataclasses import dataclass
 
 from .context import task_context
@@ -30,9 +31,18 @@ class Fastpath:
         self.verdict = verdict
         self.db_lock = db_lock
         self.wake_outbox = wake_outbox or (lambda: None)
+        self._thread_locks = {}
+        self._thread_locks_guard = threading.Lock()
 
     def handle(self, event: dict) -> dict:
         event = self._validate(event)
+        key = (event["chat_id"], event["root_msg_id"])
+        with self._thread_locks_guard:
+            thread_lock = self._thread_locks.setdefault(key, threading.Lock())
+        with thread_lock:
+            return self._handle_serialized(event)
+
+    def _handle_serialized(self, event: dict) -> dict:
         prepared = self._prepare(event)
         if prepared.react:
             try:
@@ -45,6 +55,7 @@ class Fastpath:
             retryable = task is not None and (
                 task.status == "received"
                 or (prepared.action == "clarified" and task.status == "clarifying")
+                or (prepared.action == "confirm" and task.status == "awaiting_go")
             )
             if not retryable:
                 return {"ok": True, "action": prepared.action,
