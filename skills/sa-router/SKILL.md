@@ -9,32 +9,36 @@ description: Router 控制会话角色:语义澄清与路由建议的结构化�
 
 ## 固定动作
 
-收到新任务消息时,按序输出:
+收到新任务消息时,按序执行(**sactl 在 PATH 或本仓库 tools/ 下;coordinator 地址可用环境变量 SA_COORDINATOR_URL 覆盖**):
 
-1. **歧义检查**:判断任务是否含糊到影响路由或验收标准(例如:没有验收标准、目标对象不明、任务类型无法判断)。
-   - 有歧义 → 输出澄清问题,**一次只问一个问题**,由 sa-coordinator 在 thread A 回复并 @用户;
-   - 无歧义 → 继续。
-2. **类型与标题**:依据类型注册表(RD=研发调研 / RS=投研报告 / DEV=开发实现;经 `GET /tasks` 只读或随任务下发)给出 task_type 建议与一句话标题。
-3. **结构化输出**(给 sa-coordinator 消费,严格 JSON):
+1. **先落库**(确定性,不经过你判断):从会话上下文取本条消息 message_id、chat_id、thread 根 root_msg_id 与正文,执行:
 
-```json
-{
-  "ambiguous": false,
-  "clarify_question": null,
-  "task_type": "RD",
-  "title": "支付网关重连方案调研",
-  "route_hint": "调研工场"
-}
+```bash
+sactl ingest --message-id <om_xxx> --chat-id <oc_xxx> --root-msg-id <om_root> --text "<用户原话>" --sender-open-id <ou_user>
+# 输出 {taskid, duplicate};duplicate=true 说明已处理过,直接结束,不重复路由
 ```
 
-歧义时:`{"ambiguous": true, "clarify_question": "验收标准是什么?"}`。
+2. **歧义检查**:判断任务是否含糊到影响路由或验收标准(没有验收标准、目标对象不明、任务类型无法判断)。
+   - 有歧义 → 构造 verdict `{"ambiguous": true, "clarify_question": "<一次只问一个问题>"}` → 跳到第 4 步;
+   - 无歧义 → 继续。
+3. **类型与标题**:依据类型注册表(RD=研发调研 / RS=投研报告 / DEV=开发实现)给出 task_type 建议与一句话标题;`route_hint` 可省(控制层按注册表路由)。
+4. **提交 verdict**(sa-coordinator 执行所有副作用:Get 表情、thread A 提问、种子消息、回投):
+
+```bash
+sactl route --taskid <taskid> --json '{"ambiguous": false, "task_type": "RD", "title": "支付网关重连方案调研"}'
+# 歧义时:--json '{"ambiguous": true, "clarify_question": "验收标准是什么?"}'
+# 响应 {ok, state}:running=已派单;clarifying=已提问;409 not_routeable=该任务已处理过,勿重试
+```
+
+结构化输出契约(即 verdict JSON,同上):`{"ambiguous": bool, "clarify_question": str|null, "task_type": "RD|RS|DEV", "title": str}`。
 
 ## thread A 回复的语义判断
 
-用户在 thread A 的回复只有两类:
+用户在澄清问题(thread A)下的回复有三类:
 
-- **拍板 / 追加指令**(针对当前 active_task)→ 输出 `{"decision": "<拍板内容摘要>"}`,由 sa-coordinator 转发到话题;
-- **新任务** → 走上面的固定动作。
+- **澄清答复**(任务在 clarifying)→ 执行 `sactl clarified --taskid <taskid> --answer "<答复原文>" --message-id <om_xxx>`;若答复实为新任务则加 `--new-task --chat-id <oc> --root-msg-id <om_root>`,然后对新 taskid 走固定动作第 2 步起;
+- **拍板 / 追加指令**(任务在 running/awaiting_decision)→ 输出 `{"decision": "<拍板内容摘要>"}`,由 sa-coordinator 转发到话题(P1 经控制层落库,通道建设中);
+- **新任务**(与 active_task 无关)→ 走上面的固定动作。
 
 ## 红线(禁止事项)
 
@@ -46,4 +50,5 @@ description: Router 控制会话角色:语义澄清与路由建议的结构化�
 ## 参考
 
 - 完成协议与升级协议见 sa-report(角色 bot 收尾通道)。
-- 类型注册表数据源:sa-coordinator `GET /tasks`(只读)。
+- 类型注册表数据源:sa-coordinator `GET /tasks`(只读);运维回填经 `sactl types`。
+- sactl 退出码:0=成功或重复;3=确定性拒绝(422/409,读 stderr 原因,勿盲目重试);4=不可达(可重试)。
