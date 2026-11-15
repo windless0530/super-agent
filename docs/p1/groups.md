@@ -8,16 +8,19 @@
 | 调研工场 | **oc_0862450e0a36e1ff8bb9e08ffadf7b18** | sa-router、sa-design-planner、sa-design-reviewer | Elio(owner) |
 | 开发工场 | **oc_a9096dbec0eb96f1fe4706118cbe1f1c** | sa-router、sa-develop-planner、sa-develop-executor、sa-develop-reviewer | Elio(owner) |
 
-## bot open_id(自 botmux logs 提取)
+## bot open_id(权威来源:群成员列表 member_id;bot 的 open_id 跨 app 稳定)
+
+> 注意:用户 open_id 是 app 域的(每个 app 看到的同一用户 open_id 不同);bot open_id 稳定。
+> 勿用 `botmux logs --bot <name>` 里出现的 ou_ 当 bot id——那可能是该 app 视角下的用户(如 Elio)id。
 
 | app | appId | open_id |
 |---|---|---|
 | sa-router | cli_aa561825aab8dbb5 | ou_baa4e976b84975fa081823a9e7d13941 |
-| sa-design-planner | cli_aa73f547f0f89c1a | ou_6aa0548531db6da73480eba2b56d867d |
-| sa-design-reviewer | cli_aa73f5dd27f8dbf7 | ou_176826a4fb138e960de03b35cd8448d8 |
-| sa-develop-planner | cli_aa73f5c27b39dbf6 | ou_c794f5f5076e49943c6ad0d5015baa54 |
-| sa-develop-executor | cli_aa73f5e12e789c14 | ou_4e2528585eff0ac8663515042f37a240 |
-| sa-develop-reviewer | cli_aa73f6094ff99c17 | ou_b8a1876a5ab14c39649d232af0784de5 |
+| sa-design-planner | cli_aa73f547f0f89c1a | ou_3daa13bffceb4619b7ef041913bbc4d2 |
+| sa-design-reviewer | cli_aa73f5dd27f8dbf7 | ou_efd1a7a445edf44720c5a91e83fbe714 |
+| sa-develop-planner | cli_aa73f5c27b39dbf6 | ou_15cd8ac5738acbdf3681d4272a19a159 |
+| sa-develop-executor | cli_aa73f5e12e789c14 | ou_8db6a0e6661bbf4932f616531ad2c3c2 |
+| sa-develop-reviewer | cli_aa73f6094ff99c17 | ou_da278cdd65196fa53deb6574c8dc175c |
 
 ## 建群实测结论(重要,后续建群照此)
 
@@ -40,9 +43,9 @@
 tools/sactl types set-group RD oc_0862450e0a36e1ff8bb9e08ffadf7b18 --db registry/tasks.db
 tools/sactl types set-group RS oc_0862450e0a36e1ff8bb9e08ffadf7b18 --db registry/tasks.db
 tools/sactl types set-group DEV oc_a9096dbec0eb96f1fe4706118cbe1f1c --db registry/tasks.db
-tools/sactl types set-member design ou_6aa0548531db6da73480eba2b56d867d:sa-design-planner --db registry/tasks.db
-tools/sactl types set-member review ou_176826a4fb138e960de03b35cd8448d8:sa-design-reviewer --db registry/tasks.db
-tools/sactl types set-member planner ou_c794f5f5076e49943c6ad0d5015baa54:sa-develop-planner --db registry/tasks.db
-tools/sactl types set-member executor ou_4e2528585eff0ac8663515042f37a240:sa-develop-executor --db registry/tasks.db
-tools/sactl types set-member devreview ou_b8a1876a5ab14c39649d232af0784de5:sa-develop-reviewer --db registry/tasks.db
+tools/sactl types set-member design ou_3daa13bffceb4619b7ef041913bbc4d2:sa-design-planner --db registry/tasks.db
+tools/sactl types set-member review ou_efd1a7a445edf44720c5a91e83fbe714:sa-design-reviewer --db registry/tasks.db
+tools/sactl types set-member planner ou_15cd8ac5738acbdf3681d4272a19a159:sa-develop-planner --db registry/tasks.db
+tools/sactl types set-member executor ou_8db6a0e6661bbf4932f616531ad2c3c2:sa-develop-executor --db registry/tasks.db
+tools/sactl types set-member devreview ou_da278cdd65196fa53deb6574c8dc175c:sa-develop-reviewer --db registry/tasks.db
 ```
