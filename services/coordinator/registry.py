@@ -119,6 +119,7 @@ def create_task(
     parent_task_id: str | None = None,
     payload: dict | None = None,
     placeholder: bool = False,
+    commit: bool = True,
 ) -> Task:
     """建任务(status=received,version=0),同事务幂等写 inbox_events(kind='task')。
 
@@ -147,7 +148,8 @@ def create_task(
         " VALUES (?,?,?,?,?,?)",
         (event_id, message_id, "task", taskid, json.dumps(payload or {}, ensure_ascii=False), now),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return get_task(conn, taskid)
 
 

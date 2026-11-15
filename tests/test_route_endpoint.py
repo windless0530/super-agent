@@ -142,3 +142,48 @@ def test_route_unknown_task_422(server):
     status, _ = _post(url, "/route", {"taskid": "20261115-999", "ambiguous": True,
                                       "clarify_question": "q"})
     assert status == 422
+
+
+class TestRouteFixPass:
+    """评审修复:422 不改任务行;CAS+dispatch 单事务(中途异常回滚)。"""
+
+    def _row(self, co, taskid):
+        return co.conn.execute(
+            "SELECT * FROM tasks WHERE taskid=?", (taskid,)).fetchone()
+
+    def test_422_leaves_task_row_unchanged(self, server):
+        url, co, sender, taskid = server
+        before = dict(self._row(co, taskid))
+        for bad in ({"taskid": taskid, "ambiguous": False, "task_type": "XX",
+                     "title": "T"},
+                    {"taskid": taskid, "ambiguous": False, "task_type": "RD",
+                     "title": " "},
+                    {"taskid": taskid, "ambiguous": True},
+                    {"taskid": taskid, "ambiguous": False, "task_type": "PENDING",
+                     "title": "T"}):
+            status, _ = _post(url, "/route", bad)
+            assert status == 422
+        after = dict(self._row(co, taskid))
+        for k in ("status", "version", "type", "title"):
+            assert after[k] == before[k], k
+        assert co.conn.execute(
+            "SELECT COUNT(*) c FROM outbox WHERE taskid=?", (taskid,)
+        ).fetchone()["c"] == 0
+
+    def test_cas_and_dispatch_atomic_rollback(self, server, monkeypatch):
+        url, co, _, taskid = server
+        from services.coordinator.coordinator import Coordinator
+
+        def boom(self, taskid, *, seed_text, mentions):
+            raise RuntimeError("kill -9 模拟:dispatch 前崩溃")
+
+        monkeypatch.setattr(Coordinator, "dispatch", boom)
+        status, body = _post(url, "/route", {"taskid": taskid, "ambiguous": False,
+                                             "task_type": "RD", "title": "T"})
+        assert status == 500
+        row = self._row(co, taskid)
+        assert row["status"] == "received"  # CAS 已回滚,不得停留在 running
+        assert row["type"] == "PENDING" and row["title"] != "T"
+        assert co.conn.execute(
+            "SELECT COUNT(*) c FROM outbox WHERE taskid=?", (taskid,)
+        ).fetchone()["c"] == 0

@@ -22,7 +22,9 @@ ROLE_PROVIDER = {
     "executor": ("glm.json", None),
     "reviewer": ("kimi.json", None),
     "devreviewer": ("kimi.json", None),
-    "router": ("deepseek.json", "deepseek-v4.1-flash"),  # spec 定 flash;不可用则回退 v4-pro(Task 5 实测)
+    # spec 原定 v4.1-flash;2026-11-15 实测 deepseek anthropic 端点拒绝该模型名
+    # (provider_invalid_request),回退 v4-pro
+    "router": ("deepseek.json", "deepseek-v4-pro"),
 }
 
 

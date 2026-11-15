@@ -16,8 +16,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from . import db
-from .coordinator import Coordinator, ReportRejected, utcnow_iso
-from .registry import TaskNotFound
+from .coordinator import (
+    ClarifyRejected,
+    Coordinator,
+    InvalidClarified,
+    ReportRejected,
+    utcnow_iso,
+)
+from .registry import StaleVersion, TaskNotFound
+from .state import InvalidTransition
 from .reconciler import reconcile, scan_stuck
 from .report import InvalidReport
 from .sender import LarkCliSender
@@ -94,7 +101,7 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
                     elif path == "/route":
                         body = _handle_route(co, event)
                     elif path == "/clarified":
-                        body = _handle_clarified(co, event)
+                        body = co.handle_clarified(event)
                     else:
                         body = co.handle_report(event)
                 self._json(200, body)
@@ -102,8 +109,11 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
                 self._json(422, {"error": str(e)})
             except TaskNotFound as e:
                 self._json(422, {"error": f"任务不存在: {e}"})
-            except (ReportRejected, RouteRejected) as e:
+            except (ReportRejected, RouteRejected, ClarifyRejected) as e:
                 self._json(409, e.body)
+            except (InvalidTransition, StaleVersion) as e:
+                self._json(409, {"ok": False, "reason": "state_conflict",
+                                 "error": str(e)})
             except Exception as e:  # noqa: BLE001 — 兜底:服务端 bug 不得伪装成断连
                 import logging
                 logging.getLogger("coordinator").exception("do_POST 内部错误")
@@ -129,57 +139,6 @@ class RouteRejected(Exception):
     def __init__(self, body: dict):
         self.body = body
         super().__init__(str(body))
-
-
-class InvalidClarified(ValueError):
-    """clarified 请求字段缺失或非法。"""
-
-
-def _handle_clarified(co: Coordinator, event: dict) -> dict:
-    """用户在 thread A 的澄清答复:回到 received 可再路由,或识别为新任务。
-
-    message_id 提供时按 inbox 幂等(重投不重复落 decision)。
-    is_new_task=true:原任务保持 clarifying,answer 作为新任务原文接入。
-    """
-    taskid = str(event.get("taskid") or "").strip()
-    answer = str(event.get("answer") or "").strip()
-    is_new = bool(event.get("is_new_task"))
-    message_id = str(event.get("message_id") or "").strip()
-    if not taskid:
-        raise InvalidClarified("缺少 taskid")
-    task = co.conn.execute("SELECT status FROM tasks WHERE taskid=?", (taskid,)).fetchone()
-    if task is None:
-        raise TaskNotFound(taskid)
-
-    if message_id:
-        from .inbox import claim_event
-        claim = claim_event(
-            co.conn, event_id=f"clarify:{message_id}", message_id=message_id,
-            kind="clarify", payload={"taskid": taskid, "answer": answer,
-                                     "is_new_task": is_new},
-        )
-        if not claim.new:
-            return {"ok": True, "taskid": taskid, "state": task["status"],
-                    "duplicate": True}
-
-    if is_new:
-        # 新任务的 thread A 根 = 答案消息自身(其讨论从该消息展开),
-        # 不复用原任务根——否则孤儿恢复按 thread_a_msg_id 找回原任务。
-        msg_key = message_id or f"clarify-new:{taskid}:{answer[:32]}"
-        r = co.ingest_task(
-            event_id=f"msg:{msg_key}",
-            message_id=msg_key,
-            text=answer, task_type="PENDING", title=answer[:60],
-            thread_chat_id=event.get("chat_id") or None,
-            thread_root_msg_id=msg_key,
-            allow_placeholder_type=True,
-        )
-        return {"ok": True, "new_taskid": r.taskid, "duplicate": not r.new}
-
-    if not answer:
-        raise InvalidClarified("is_new_task=false 时必须携带 answer")
-    co.apply_clarified(taskid, answer)
-    return {"ok": True, "taskid": taskid, "state": "received", "duplicate": False}
 
 
 def _handle_route(co: Coordinator, event: dict) -> dict:
@@ -228,7 +187,10 @@ def _handle_route(co: Coordinator, event: dict) -> dict:
                              "type": task_type})
 
     import json as _json
-    roles = _json.loads(trow["roles"])
+    try:
+        roles = _json.loads(trow["roles"])
+    except ValueError as e:
+        raise InvalidRoute(f"类型注册表 roles 损坏: {task_type} ({e})") from e
     mention_rows = {
         r["role"]: r["mention"]
         for r in co.conn.execute("SELECT role, mention FROM role_members")
@@ -247,12 +209,18 @@ def _handle_route(co: Coordinator, event: dict) -> dict:
             brief = str((_json.loads(brief_row["payload"]) or {}).get("text") or "")
         except (ValueError, TypeError):
             brief = ""
-    cas_update(co.conn, taskid, task["version"],
-               type=task_type, title=title, status="running")
-    co.dispatch(taskid, seed_text=render_seed(
-        taskid=taskid, title=title, type_name=trow["name"],
-        roles=roles, rounds_limit=trow["rounds_limit"], brief=brief,
-    ), mentions=mentions)
+    # CAS 与 dispatch 入队同一事务:dispatch 前崩溃不留下 running 无种子的任务
+    try:
+        cas_update(co.conn, taskid, task["version"],
+                   type=task_type, title=title, status="running", commit=False)
+        co.dispatch(taskid, seed_text=render_seed(
+            taskid=taskid, title=title, type_name=trow["name"],
+            roles=roles, rounds_limit=trow["rounds_limit"], brief=brief,
+        ), mentions=mentions, commit=False)
+        co.conn.commit()
+    except Exception:
+        co.conn.rollback()
+        raise
     return {"ok": True, "taskid": taskid, "state": "running"}
 
 

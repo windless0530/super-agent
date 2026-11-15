@@ -46,6 +46,18 @@ class IngestResult:
     new: bool
 
 
+class InvalidClarified(ValueError):
+    """clarified 请求字段缺失或非法。"""
+
+
+class ClarifyRejected(Exception):
+    """确定性拒绝(任务非 clarifying);body 随异常携带。"""
+
+    def __init__(self, body: dict):
+        self.body = body
+        super().__init__(str(body))
+
+
 class ReportRejected(Exception):
     """report 被确定性拒绝(如任务非 running);body 携带原因。"""
 
@@ -85,13 +97,17 @@ class Coordinator:
         thread_chat_id: str | None = None,
         thread_root_msg_id: str | None = None,
         allow_placeholder_type: bool = False,
+        commit: bool = True,
     ) -> IngestResult:
         """任务消息接入:幂等(重复事件返回既有任务,不再 Get)。"""
         claim = claim_event(
             self.conn, event_id=event_id, message_id=message_id,
             kind="task", payload={"text": text, "title": title},
+            commit=commit,
         )
         if not claim.new and claim.prev_taskid:
+            if commit:
+                self.conn.commit()
             return IngestResult(taskid=claim.prev_taskid, new=False)
         # 孤儿占位恢复(claim 已入库但 taskid 未回填):
         # ① 任务其实已建(create 提交后、bind 前崩溃)→ 按 thread_a_msg_id 找回;
@@ -101,7 +117,7 @@ class Coordinator:
             (thread_root_msg_id or message_id,),
         ).fetchone()
         if orphan is not None:
-            bind_taskid(self.conn, event_id, orphan[0])
+            bind_taskid(self.conn, event_id, orphan[0], commit=commit)
             return IngestResult(taskid=orphan[0], new=False)
         task = create_task(
             self.conn, type=task_type, title=title,
@@ -110,10 +126,11 @@ class Coordinator:
             thread_a_chat_id=thread_chat_id,
             payload={"text": text},
             placeholder=allow_placeholder_type,
+            commit=commit,
         )
-        bind_taskid(self.conn, event_id, task.taskid)
+        bind_taskid(self.conn, event_id, task.taskid, commit=commit)
         # Get 表情:非可靠链路,失败仅记日志
-        if thread_chat_id:
+        if thread_chat_id and commit:
             try:
                 self.sender.add_reaction(thread_chat_id, thread_root_msg_id or message_id, "Get")
             except Exception:  # noqa: BLE001
@@ -131,7 +148,8 @@ class Coordinator:
             raise ValueError(f"类型 {task.type} 未配置 group_chat_id(P0 建群后回填)")
         return chat_id
 
-    def dispatch(self, taskid: str, *, seed_text: str, mentions: tuple[str, ...]) -> None:
+    def dispatch(self, taskid: str, *, seed_text: str, mentions: tuple[str, ...],
+                 commit: bool = True) -> None:
         """入队种子消息(发送由 process_due_outbox 承担;enqueue-first)。"""
         task = get_task(self.conn, taskid)
         if task is None:
@@ -145,6 +163,7 @@ class Coordinator:
                 "mentions": list(mentions),
                 "active_role": mentions[0] if mentions else None,
             },
+            commit=commit,
         )
 
     # ---------- report ----------
@@ -261,6 +280,77 @@ class Coordinator:
             self.conn, taskid, task.version,
             decisions=list(task.decisions) + [{"text": answer_note}],
         )
+
+    def handle_clarified(self, event: dict) -> dict:
+        """澄清答复端点逻辑(评审修复后的不变式):
+
+        1. 校验前置(taskid/answer 非空、任务存在、状态必须 clarifying)——
+           任何拒绝都不触碰 inbox,重试不被 duplicate 假成功吞掉;
+        2. claim + 落库/建新任务同一事务,异常整体回滚,崩溃窗口不烧 message_id;
+        3. is_new 分支用派生 message_id(clarify-answer:<id>),避免与 clarify
+           占位行撞 message_id UNIQUE 导致新任务丢失 kind='task' inbox 行。
+        """
+        taskid = str(event.get("taskid") or "").strip()
+        answer = str(event.get("answer") or "").strip()
+        is_new = bool(event.get("is_new_task"))
+        message_id = str(event.get("message_id") or "").strip()
+        if not taskid:
+            raise InvalidClarified("缺少 taskid")
+        if not answer:
+            raise InvalidClarified("缺少 answer")
+        task = get_task(self.conn, taskid)
+        if task is None:
+            raise TaskNotFound(taskid)
+        # 真重复(同 message_id 已成功处理过)在状态门之前返回:
+        # 占位行只在成功事务里落库,存在即表示首次处理已完成
+        if message_id:
+            seen = self.conn.execute(
+                "SELECT 1 FROM inbox_events WHERE event_id=?",
+                (f"clarify:{message_id}",),
+            ).fetchone()
+            if seen is not None:
+                return {"ok": True, "taskid": taskid,
+                        "state": task.status, "duplicate": True}
+        if task.status != "clarifying":
+            raise ClarifyRejected(
+                {"ok": False, "reason": "not_clarifying", "status": task.status})
+
+        try:
+            if message_id:
+                claim = claim_event(
+                    self.conn, event_id=f"clarify:{message_id}",
+                    message_id=message_id, kind="clarify",
+                    payload={"taskid": taskid, "answer": answer,
+                             "is_new_task": is_new},
+                    commit=False,
+                )
+                if not claim.new:
+                    self.conn.rollback()  # 纯读判定,无未提交写
+                    return {"ok": True, "taskid": taskid,
+                            "state": task.status, "duplicate": True}
+            if is_new:
+                msg_key = (f"clarify-answer:{message_id}" if message_id
+                           else f"clarify-new:{taskid}:{answer[:32]}")
+                r = self.ingest_task(
+                    event_id=f"msg:{msg_key}", message_id=msg_key,
+                    text=answer, task_type="PENDING", title=answer[:60],
+                    thread_chat_id=event.get("chat_id") or None,
+                    thread_root_msg_id=msg_key,
+                    allow_placeholder_type=True, commit=False,
+                )
+                self.conn.commit()
+                return {"ok": True, "new_taskid": r.taskid, "duplicate": not r.new}
+            t = cas_update(self.conn, taskid, task.version,
+                           status="received", commit=False)
+            cas_update(self.conn, taskid, t.version,
+                       decisions=list(task.decisions) + [{"text": answer}],
+                       commit=False)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return {"ok": True, "taskid": taskid, "state": "received",
+                "duplicate": False}
 
     # ---------- outbox 推进 ----------
 

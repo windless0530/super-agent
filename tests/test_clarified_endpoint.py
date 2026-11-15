@@ -106,3 +106,49 @@ def test_clarified_missing_answer_422(server):
     status, _ = _post(url, "/clarified", {"taskid": taskid, "answer": " ",
                                           "is_new_task": False})
     assert status == 422
+
+
+def co_row(co, taskid):
+    return co.conn.execute(
+        "SELECT * FROM tasks WHERE taskid=?", (taskid,)).fetchone()
+
+
+class TestClarifyFixPass:
+    """评审修复:先校验后占位、单事务、is_new 派生 message_id(不烧答复)。"""
+
+    def test_second_answer_409_not_clarifying_no_burn(self, server):
+        url, co, taskid = server
+        # 第一条答复:合法,任务回 received
+        s1, _ = _post(url, "/clarified", {"taskid": taskid, "answer": "验收:X",
+                                          "is_new_task": False, "message_id": "om_a1"})
+        assert s1 == 200
+        # 第二条答复(任务已非 clarifying):确定性 409,不得 500、不得烧 message_id
+        s2, body = _post(url, "/clarified", {"taskid": taskid, "answer": "补充:Y",
+                                             "is_new_task": False, "message_id": "om_a2"})
+        assert s2 == 409 and body["reason"] == "not_clarifying"
+        burned = co.conn.execute(
+            "SELECT 1 FROM inbox_events WHERE message_id='om_a2'").fetchone()
+        assert burned is None  # message_id 未被占位烧掉
+
+    def test_empty_answer_422_then_same_message_id_succeeds(self, server):
+        url, co, taskid = server
+        s1, _ = _post(url, "/clarified", {"taskid": taskid, "answer": "  ",
+                                          "is_new_task": False, "message_id": "om_b1"})
+        assert s1 == 422
+        # 修正后用同一 message_id 重试:必须真实生效,不得 duplicate 假成功
+        s2, body = _post(url, "/clarified", {"taskid": taskid, "answer": "验收:Z",
+                                             "is_new_task": False, "message_id": "om_b1"})
+        assert s2 == 200 and body["duplicate"] is False
+        row = co_row(co, taskid)
+        assert "验收:Z" in row["decisions"]
+
+    def test_is_new_has_task_inbox_row(self, server):
+        url, co, taskid = server
+        s, body = _post(url, "/clarified", {
+            "taskid": taskid, "answer": "新任务:调研 Y", "is_new_task": True,
+            "message_id": "om_c1", "chat_id": "oc_router", "root_msg_id": "om_root"})
+        assert s == 200
+        row = co.conn.execute(
+            "SELECT 1 FROM inbox_events WHERE taskid=? AND kind='task'",
+            (body["new_taskid"],)).fetchone()
+        assert row is not None  # 新任务必须有 kind='task' 的 inbox 行

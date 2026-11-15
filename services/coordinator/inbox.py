@@ -54,9 +54,11 @@ def claim_event(
         return ClaimResult(new=False, taskid=None, prev_taskid=prev_taskid)
 
 
-def bind_taskid(conn: sqlite3.Connection, event_id: str, taskid: str) -> None:
-    """占位成功后回填 taskid(claim 与建任务通常同事务,这里显式提交)。"""
+def bind_taskid(conn: sqlite3.Connection, event_id: str, taskid: str,
+                commit: bool = True) -> None:
+    """占位成功后回填 taskid(commit=False 时并入调用方事务)。"""
     conn.execute(
         "UPDATE inbox_events SET taskid=? WHERE event_id=?", (taskid, event_id)
     )
-    conn.commit()
+    if commit:
+        conn.commit()
