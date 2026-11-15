@@ -5,6 +5,7 @@
   report  提交完成/升级事件(POST /report)
   task    查看任务(show)
   ingest  任务消息接入(POST /ingest,幂等)
+  route   提交 Router verdict(POST /route)
 
 退出码:0 = accepted 或 duplicate;3 = 服务端拒绝(422);4 = 不可达。
 幂等:event_id 每次调用生成一次,跨重试复用;服务端按 event_id 去重。
@@ -118,6 +119,32 @@ def cmd_ingest(args) -> int:
     return 0
 
 
+def cmd_route(args) -> int:
+    """v1.2 固定动作 2/3:提交 Router verdict(歧义提问或类型+标题)。"""
+    raw = args.json
+    if raw == "-":
+        raw = sys.stdin.read()
+    try:
+        verdict = json.loads(raw)
+        if not isinstance(verdict, dict):
+            raise ValueError("verdict 必须是 JSON 对象")
+    except ValueError as e:
+        print(f"sactl: verdict 非法 JSON: {e}", file=sys.stderr)
+        return 2
+    body = {"taskid": args.taskid, **verdict}
+    url = _base_url(args.url) + "/route"
+    try:
+        status, resp = _post(url, body)
+    except Exception as e:  # noqa: BLE001
+        print(f"sactl: 不可达 {url}: {e}", file=sys.stderr)
+        return 4
+    if status in (422, 409):
+        print(f"sactl: 被拒绝: {resp.get('error') or resp.get('reason')}", file=sys.stderr)
+        return 3
+    print(json.dumps(resp, ensure_ascii=False))
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="sactl", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -146,6 +173,13 @@ def main(argv=None) -> int:
     p.add_argument("--sender-open-id")
     p.add_argument("--url")
     p.set_defaults(func=cmd_ingest)
+
+    p = sub.add_parser("route", help="提交 Router verdict(歧义或类型+标题)")
+    p.add_argument("--taskid", required=True)
+    p.add_argument("--json", required=True,
+                   help="verdict JSON 对象;传 - 从 stdin 读")
+    p.add_argument("--url")
+    p.set_defaults(func=cmd_route)
 
     args = parser.parse_args(argv)
     if args.cmd == "task":

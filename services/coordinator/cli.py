@@ -78,7 +78,7 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
 
         def do_POST(self):  # noqa: N802
             path = urlparse(self.path).path
-            if path not in ("/report", "/ingest"):
+            if path not in ("/report", "/ingest", "/route"):
                 self._json(404, {"error": "not found"})
                 return
             try:
@@ -91,14 +91,16 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
                 with lock:
                     if path == "/ingest":
                         body = _handle_ingest(co, event)
+                    elif path == "/route":
+                        body = _handle_route(co, event)
                     else:
                         body = co.handle_report(event)
                 self._json(200, body)
-            except (InvalidIngest, InvalidReport) as e:
+            except (InvalidIngest, InvalidRoute, InvalidReport) as e:
                 self._json(422, {"error": str(e)})
             except TaskNotFound as e:
                 self._json(422, {"error": f"任务不存在: {e}"})
-            except ReportRejected as e:
+            except (ReportRejected, RouteRejected) as e:
                 self._json(409, e.body)
             except Exception as e:  # noqa: BLE001 — 兜底:服务端 bug 不得伪装成断连
                 import logging
@@ -113,6 +115,92 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
 
 class InvalidIngest(ValueError):
     """ingest 请求字段缺失或非法。"""
+
+
+class InvalidRoute(ValueError):
+    """route verdict 字段缺失或非法(Review Focus #2:拒绝半派单)。"""
+
+
+class RouteRejected(Exception):
+    """确定性拒绝(状态不可路由/群未配置);body 随异常携带。"""
+
+    def __init__(self, body: dict):
+        self.body = body
+        super().__init__(str(body))
+
+
+def _handle_route(co: Coordinator, event: dict) -> dict:
+    """v1.2 固定动作 2/3:Router verdict → 澄清提问 或 类型回填 + 派单。
+
+    - ambiguous → set_clarifying(thread A 提问,outbox 承担发送)
+    - 完整 verdict → 校验类型注册表(显式拒绝 PENDING 占位)→
+      cas 回填 type/title 并置 running → 渲染种子 → dispatch 入队
+      (与 /report 同构:状态先行,outbox 兜投)
+    - mentions:role_members 已配置则用 mention 令牌,否则回退角色名。
+    """
+    taskid = str(event.get("taskid") or "").strip()
+    if not taskid:
+        raise InvalidRoute("缺少 taskid")
+    task = co.conn.execute("SELECT * FROM tasks WHERE taskid=?", (taskid,)).fetchone()
+    if task is None:
+        raise TaskNotFound(taskid)
+    ambiguous = event.get("ambiguous")
+    if not isinstance(ambiguous, bool):
+        raise InvalidRoute("ambiguous 必须为布尔值")
+    if task["status"] != "received":
+        raise RouteRejected({"ok": False, "reason": "not_routeable",
+                             "status": task["status"]})
+
+    if ambiguous:
+        question = str(event.get("clarify_question") or "").strip()
+        if not question:
+            raise InvalidRoute("ambiguous=true 时必须携带 clarify_question")
+        co.set_clarifying(taskid, question)
+        return {"ok": True, "taskid": taskid, "state": "clarifying"}
+
+    task_type = str(event.get("task_type") or "").strip()
+    title = str(event.get("title") or "").strip()
+    if not title:
+        raise InvalidRoute("缺少 title")
+    if task_type == "PENDING":
+        raise InvalidRoute("task_type 不能为占位符 PENDING")
+    trow = co.conn.execute(
+        "SELECT name, group_chat_id, roles, rounds_limit FROM task_types"
+        " WHERE type_code=? AND enabled=1", (task_type,),
+    ).fetchone()
+    if trow is None:
+        raise InvalidRoute(f"未知或未启用的 task_type: {task_type}")
+    if not trow["group_chat_id"]:
+        raise RouteRejected({"ok": False, "reason": "group_not_configured",
+                             "type": task_type})
+
+    import json as _json
+    roles = _json.loads(trow["roles"])
+    mention_rows = {
+        r["role"]: r["mention"]
+        for r in co.conn.execute("SELECT role, mention FROM role_members")
+    }
+    mentions = tuple(mention_rows.get(role, role) for role in roles)
+
+    from .registry import cas_update
+    from .seed import render_seed
+    brief_row = co.conn.execute(
+        "SELECT payload FROM inbox_events WHERE taskid=? AND kind='task'"
+        " ORDER BY received_at LIMIT 1", (taskid,),
+    ).fetchone()
+    brief = ""
+    if brief_row is not None:
+        try:
+            brief = str((_json.loads(brief_row["payload"]) or {}).get("text") or "")
+        except (ValueError, TypeError):
+            brief = ""
+    cas_update(co.conn, taskid, task["version"],
+               type=task_type, title=title, status="running")
+    co.dispatch(taskid, seed_text=render_seed(
+        taskid=taskid, title=title, type_name=trow["name"],
+        roles=roles, rounds_limit=trow["rounds_limit"], brief=brief,
+    ), mentions=mentions)
+    return {"ok": True, "taskid": taskid, "state": "running"}
 
 
 def _handle_ingest(co: Coordinator, event: dict) -> dict:

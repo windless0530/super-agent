@@ -93,6 +93,11 @@ CREATE TABLE IF NOT EXISTS taskid_seq (
     taskid_date TEXT PRIMARY KEY,
     last        INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS role_members (
+    role   TEXT PRIMARY KEY,
+    mention TEXT NOT NULL
+);
 """
 
 # 默认类型注册表;group_chat_id 待 P0 实测建群后回填

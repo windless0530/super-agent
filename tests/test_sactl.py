@@ -214,3 +214,58 @@ class TestIngest:
              "--root-msg-id", "r", "--text", "t"],
         )
         assert code == 4
+
+
+class TestRoute:
+    """route 子命令:verdict 原样透传 /route。"""
+
+    def _run_route(self, monkeypatch, responses, argv):
+        fake = URLOk(responses)
+        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        monkeypatch.setattr(sactl.time, "sleep", lambda s: None)
+        code = sactl.main(["route"] + argv)
+        return code, fake
+
+    def test_route_ok_exit0(self, monkeypatch, capsys):
+        code, fake = self._run_route(
+            monkeypatch,
+            [FakeResponse(200, {"ok": True, "taskid": "20261115-001", "state": "running"})],
+            ["--taskid", "20261115-001",
+             "--json", '{"ambiguous": false, "task_type": "RD", "title": "T"}'],
+        )
+        assert code == 0
+        req = fake.requests[0]
+        assert req["url"].endswith("/route")
+        assert req["body"] == {"taskid": "20261115-001", "ambiguous": False,
+                               "task_type": "RD", "title": "T"}
+        out = json.loads(capsys.readouterr().out)
+        assert out["state"] == "running"
+
+    def test_route_stdin_json(self, monkeypatch):
+        import io
+        monkeypatch.setattr(sys, "stdin", io.StringIO('{"ambiguous": true, "clarify_question": "Q"}'))
+        code, fake = self._run_route(
+            monkeypatch,
+            [FakeResponse(200, {"ok": True, "state": "clarifying"})],
+            ["--taskid", "t-1", "--json", "-"],
+        )
+        assert code == 0
+        assert fake.requests[0]["body"]["clarify_question"] == "Q"
+
+    def test_route_422_and_409_exit3(self, monkeypatch):
+        code, _ = self._run_route(
+            monkeypatch,
+            [FakeResponse(422, {"error": "未知 task_type"})],
+            ["--taskid", "t", "--json", '{"ambiguous": false}'],
+        )
+        assert code == 3
+        code, _ = self._run_route(
+            monkeypatch,
+            [FakeResponse(409, {"ok": False, "reason": "not_routeable"})],
+            ["--taskid", "t", "--json", '{"ambiguous": false}'],
+        )
+        assert code == 3
+
+    def test_route_bad_json_exit2(self, monkeypatch):
+        code = sactl.main(["route", "--taskid", "t", "--json", "not-json"])
+        assert code == 2
