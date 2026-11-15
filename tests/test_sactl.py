@@ -269,3 +269,45 @@ class TestRoute:
     def test_route_bad_json_exit2(self, monkeypatch):
         code = sactl.main(["route", "--taskid", "t", "--json", "not-json"])
         assert code == 2
+
+
+class TestClarified:
+    """clarified 子命令:澄清答复上报。"""
+
+    def _run(self, monkeypatch, responses, argv):
+        fake = URLOk(responses)
+        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        monkeypatch.setattr(sactl.time, "sleep", lambda s: None)
+        return sactl.main(["clarified"] + argv), fake
+
+    def test_clarified_answer(self, monkeypatch, capsys):
+        code, fake = self._run(
+            monkeypatch,
+            [FakeResponse(200, {"ok": True, "taskid": "t-1",
+                                "state": "received", "duplicate": False})],
+            ["--taskid", "t-1", "--answer", "验收:X", "--message-id", "om_a"],
+        )
+        assert code == 0
+        req = fake.requests[0]
+        assert req["url"].endswith("/clarified")
+        assert req["body"] == {"taskid": "t-1", "answer": "验收:X",
+                               "is_new_task": False, "message_id": "om_a"}
+
+    def test_clarified_new_task_flag(self, monkeypatch):
+        code, fake = self._run(
+            monkeypatch,
+            [FakeResponse(200, {"ok": True, "new_taskid": "t-2"})],
+            ["--taskid", "t-1", "--answer", "新任务Y", "--new-task",
+             "--message-id", "om_b", "--chat-id", "oc_r", "--root-msg-id", "om_root"],
+        )
+        assert code == 0
+        body = fake.requests[0]["body"]
+        assert body["is_new_task"] is True
+
+    def test_clarified_422_exit3(self, monkeypatch):
+        code, _ = self._run(
+            monkeypatch,
+            [FakeResponse(422, {"error": "任务不存在: t-9"})],
+            ["--taskid", "t-9", "--answer", "a"],
+        )
+        assert code == 3

@@ -2,6 +2,7 @@
 
 依据:落地方案 v1.2「任务登记表:状态机」与 Watchdog 超时口径。
 - received → clarifying(歧义澄清)/ running(直接派单)
+- clarifying → received(澄清答复已记录,可继续路由;v1.2 澄清只发生在派单前)
 - running → report_pending(收到 sactl report)
 - report_pending → running(需继续工作)/ done(completed 回投完成)/ awaiting_decision(escalated 待拍板)
 - awaiting_decision → running(决策已转发话题)
@@ -21,7 +22,7 @@ TERMINAL = {"done"}
 
 TRANSITIONS: dict[str, set[str]] = {
     "received": {"clarifying", "running"},
-    "clarifying": {"running"},
+    "clarifying": {"received"},
     "running": {"report_pending"},
     "report_pending": {"running", "done", "awaiting_decision"},
     "awaiting_decision": {"running"},

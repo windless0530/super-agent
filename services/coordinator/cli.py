@@ -78,7 +78,7 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
 
         def do_POST(self):  # noqa: N802
             path = urlparse(self.path).path
-            if path not in ("/report", "/ingest", "/route"):
+            if path not in ("/report", "/ingest", "/route", "/clarified"):
                 self._json(404, {"error": "not found"})
                 return
             try:
@@ -93,10 +93,12 @@ def make_handler(co: Coordinator, lock: threading.Lock | None = None):
                         body = _handle_ingest(co, event)
                     elif path == "/route":
                         body = _handle_route(co, event)
+                    elif path == "/clarified":
+                        body = _handle_clarified(co, event)
                     else:
                         body = co.handle_report(event)
                 self._json(200, body)
-            except (InvalidIngest, InvalidRoute, InvalidReport) as e:
+            except (InvalidIngest, InvalidRoute, InvalidClarified, InvalidReport) as e:
                 self._json(422, {"error": str(e)})
             except TaskNotFound as e:
                 self._json(422, {"error": f"任务不存在: {e}"})
@@ -127,6 +129,57 @@ class RouteRejected(Exception):
     def __init__(self, body: dict):
         self.body = body
         super().__init__(str(body))
+
+
+class InvalidClarified(ValueError):
+    """clarified 请求字段缺失或非法。"""
+
+
+def _handle_clarified(co: Coordinator, event: dict) -> dict:
+    """用户在 thread A 的澄清答复:回到 received 可再路由,或识别为新任务。
+
+    message_id 提供时按 inbox 幂等(重投不重复落 decision)。
+    is_new_task=true:原任务保持 clarifying,answer 作为新任务原文接入。
+    """
+    taskid = str(event.get("taskid") or "").strip()
+    answer = str(event.get("answer") or "").strip()
+    is_new = bool(event.get("is_new_task"))
+    message_id = str(event.get("message_id") or "").strip()
+    if not taskid:
+        raise InvalidClarified("缺少 taskid")
+    task = co.conn.execute("SELECT status FROM tasks WHERE taskid=?", (taskid,)).fetchone()
+    if task is None:
+        raise TaskNotFound(taskid)
+
+    if message_id:
+        from .inbox import claim_event
+        claim = claim_event(
+            co.conn, event_id=f"clarify:{message_id}", message_id=message_id,
+            kind="clarify", payload={"taskid": taskid, "answer": answer,
+                                     "is_new_task": is_new},
+        )
+        if not claim.new:
+            return {"ok": True, "taskid": taskid, "state": task["status"],
+                    "duplicate": True}
+
+    if is_new:
+        # 新任务的 thread A 根 = 答案消息自身(其讨论从该消息展开),
+        # 不复用原任务根——否则孤儿恢复按 thread_a_msg_id 找回原任务。
+        msg_key = message_id or f"clarify-new:{taskid}:{answer[:32]}"
+        r = co.ingest_task(
+            event_id=f"msg:{msg_key}",
+            message_id=msg_key,
+            text=answer, task_type="PENDING", title=answer[:60],
+            thread_chat_id=event.get("chat_id") or None,
+            thread_root_msg_id=msg_key,
+            allow_placeholder_type=True,
+        )
+        return {"ok": True, "new_taskid": r.taskid, "duplicate": not r.new}
+
+    if not answer:
+        raise InvalidClarified("is_new_task=false 时必须携带 answer")
+    co.apply_clarified(taskid, answer)
+    return {"ok": True, "taskid": taskid, "state": "received", "duplicate": False}
 
 
 def _handle_route(co: Coordinator, event: dict) -> dict:

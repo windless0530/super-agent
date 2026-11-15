@@ -252,10 +252,11 @@ class Coordinator:
         )
 
     def apply_clarified(self, taskid: str, answer_note: str) -> None:
+        """澄清答复落库并回到 received(可再次 /route 派单)。"""
         task = get_task(self.conn, taskid)
         if task is None:
             raise TaskNotFound(taskid)
-        task = cas_update(self.conn, taskid, task.version, status="running")
+        task = cas_update(self.conn, taskid, task.version, status="received")
         cas_update(
             self.conn, taskid, task.version,
             decisions=list(task.decisions) + [{"text": answer_note}],

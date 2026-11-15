@@ -6,6 +6,7 @@
   task    查看任务(show)
   ingest  任务消息接入(POST /ingest,幂等)
   route   提交 Router verdict(POST /route)
+  clarified 澄清答复上报(POST /clarified)
 
 退出码:0 = accepted 或 duplicate;3 = 服务端拒绝(422);4 = 不可达。
 幂等:event_id 每次调用生成一次,跨重试复用;服务端按 event_id 去重。
@@ -145,6 +146,29 @@ def cmd_route(args) -> int:
     return 0
 
 
+def cmd_clarified(args) -> int:
+    """澄清答复上报:回到可路由态(--new-task 则作为新任务接入)。"""
+    body = {"taskid": args.taskid, "answer": args.answer,
+            "is_new_task": bool(args.new_task)}
+    if args.message_id:
+        body["message_id"] = args.message_id
+    if args.chat_id:
+        body["chat_id"] = args.chat_id
+    if args.root_msg_id:
+        body["root_msg_id"] = args.root_msg_id
+    url = _base_url(args.url) + "/clarified"
+    try:
+        status, resp = _post(url, body)
+    except Exception as e:  # noqa: BLE001
+        print(f"sactl: 不可达 {url}: {e}", file=sys.stderr)
+        return 4
+    if status in (422, 409):
+        print(f"sactl: 被拒绝: {resp.get('error') or resp.get('reason')}", file=sys.stderr)
+        return 3
+    print(json.dumps(resp, ensure_ascii=False))
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="sactl", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -180,6 +204,17 @@ def main(argv=None) -> int:
                    help="verdict JSON 对象;传 - 从 stdin 读")
     p.add_argument("--url")
     p.set_defaults(func=cmd_route)
+
+    p = sub.add_parser("clarified", help="澄清答复上报(可再路由或转新任务)")
+    p.add_argument("--taskid", required=True)
+    p.add_argument("--answer", required=True)
+    p.add_argument("--new-task", action="store_true",
+                   help="答复识别为新任务原文(原任务保持 clarifying)")
+    p.add_argument("--message-id", help="答复消息 id(幂等去重)")
+    p.add_argument("--chat-id")
+    p.add_argument("--root-msg-id")
+    p.add_argument("--url")
+    p.set_defaults(func=cmd_clarified)
 
     args = parser.parse_args(argv)
     if args.cmd == "task":

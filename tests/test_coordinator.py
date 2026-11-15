@@ -282,7 +282,7 @@ class TestDecisionAndClarify:
         assert q["chat_id"] == ROUTER_CHAT and "验收标准" in q["text"]
         co.apply_clarified(r.taskid, "答复:重连成功率 > 99%")
         t = get_task(conn, r.taskid)
-        assert t.status == "running"
+        assert t.status == "received"
         assert t.decisions[-1]["text"] == "答复:重连成功率 > 99%"
 
 
