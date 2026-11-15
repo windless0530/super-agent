@@ -19,7 +19,7 @@ lark-cli im +messages-send \
 
 ## 未通过/未覆盖
 
-- 目标 bot 的模型调用返回 `provider_authentication_failed`,没有完成预期文本回复。
-- 当前只有目标 bot 接入 botmux;发送 bot 仅通过 lark-cli 发消息,未验证两个 botmux worker 的双向往返。
+- ~~目标 bot 的模型调用返回 `provider_authentication_failed`,没有完成预期文本回复。~~ **已解决(2026-11-15)**:根因与修复见探针 #2「凭据修复复测」;复测 3/3 话题在各自线程收到 `cli_aa561825aab8dbb5` 的固定文本回复 `P0-OK`(glm-5.3)。「跨 bot @ 唤醒 + 同话题语义回复」完整通过。
+- 当前只有目标 bot 接入 botmux;发送 bot 仅通过 lark-cli 发消息,未验证两个 botmux worker 的双向往返。**仍待 P1**。
 
-P1 配置第二个 botmux worker、修复模型凭据后需补跑反向 @ 和双向各一轮固定文本回复。
+P1 配置第二个 botmux worker 后需补跑反向 @ 和双向各一轮固定文本回复。
