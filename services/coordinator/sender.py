@@ -17,6 +17,10 @@ from typing import Protocol, runtime_checkable
 
 DEFAULT_SEND_CMD = "botmux send --chat-id {chat_id} {text}"
 DEFAULT_REPLY_CMD = "botmux send --into {root} {text}"
+DEFAULT_SEED_SEND_CMD = (
+    "lark-cli --profile sa-router im +messages-send --chat-id {chat_id} "
+    "--msg-type text --text {text} --as bot"
+)
 DEFAULT_REACTION_CMD = (
     "lark-cli im reactions create --message-id {msg_id} "
     "--data {reaction_body} --as bot"
@@ -41,6 +45,10 @@ class AmbiguousSendError(SendError):
 
 @runtime_checkable
 class Sender(Protocol):
+    def send_seed(
+        self, chat_id: str, text: str, mentions: tuple[str, ...] = ()
+    ) -> str: ...
+
     def send_top_level(
         self, chat_id: str, text: str, mentions: tuple[str, ...] = ()
     ) -> str: ...
@@ -132,6 +140,24 @@ class LarkCliSender:
         else:
             argv.append("--no-mention")
         return argv
+
+    def send_seed(
+        self, chat_id: str, text: str, mentions: tuple[str, ...] = ()
+    ) -> str:
+        """工场种子用原生 text,保证话题列表标题可见;不带 botmux 参数。"""
+        mention_text = []
+        for mention in mentions:
+            open_id, sep, name = mention.partition(":")
+            if sep and open_id.startswith("ou_") and name:
+                mention_text.append(f'<at user_id="{open_id}">{name}</at>')
+            else:
+                mention_text.append(f"@{mention}")
+        full_text = text + ("\n" + " ".join(mention_text) if mention_text else "")
+        template = self._template("SA_SEED_SEND_CMD", DEFAULT_SEED_SEND_CMD)
+        argv = [a for a in shlex.split(template.format(
+            chat_id=shlex.quote(chat_id), text=shlex.quote(full_text),
+        )) if a]
+        return self._extract(self._run(argv), argv)
 
     def send_top_level(
         self, chat_id: str, text: str, mentions: tuple[str, ...] = ()

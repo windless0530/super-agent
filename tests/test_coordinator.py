@@ -21,6 +21,7 @@ class FakeSender:
 
     def __init__(self):
         self.top_level = []
+        self.seed_calls = []
         self.replies = []
         self.reactions = []
         self.fail_top_level = None  # 异常实例或 None
@@ -31,6 +32,11 @@ class FakeSender:
         msg_id = f"om_top_{len(self.top_level) + 1}"
         self.top_level.append({"chat_id": chat_id, "text": text, "mentions": tuple(mentions), "msg_id": msg_id})
         return msg_id
+
+    def send_seed(self, chat_id, text, mentions=()):
+        self.seed_calls.append({"chat_id": chat_id, "text": text,
+                                "mentions": tuple(mentions)})
+        return self.send_top_level(chat_id, text, mentions)
 
     def send_reply(self, chat_id, root_msg_id, text, mentions=()):
         msg_id = f"om_reply_{len(self.replies) + 1}"
@@ -116,6 +122,8 @@ class TestDispatch:
         n = co.process_due_outbox()
         assert n == 1
         assert len(sender.top_level) == 1
+        assert len(sender.seed_calls) == 1
+        assert sender.seed_calls[0]["chat_id"] == "oc_research"
         call = sender.top_level[0]
         assert call["chat_id"] == "oc_research"
         assert "支付重连" in call["text"]

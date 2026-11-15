@@ -36,6 +36,28 @@ def _patch_run(monkeypatch, behavior):
     return calls
 
 
+def test_send_seed_uses_native_text_profile_and_mentions(monkeypatch, sender):
+    monkeypatch.setenv("SA_BOTMUX_SESSION_ID", "must-not-leak-into-lark-cli")
+    calls = _patch_run(
+        monkeypatch,
+        lambda argv: FakeCompleted(stdout='{"ok":true,"data":{"message_id":"om_seed"}}'),
+    )
+    text = "[20261115-001] 标题\n正文 hello --chat-id oc_evil"
+    msg_id = sender.send_seed("oc_factory", text, ("ou_1:研发导师",))
+    assert msg_id == "om_seed"
+    argv = calls[0]
+    assert argv[:5] == ["lark-cli", "--profile", "sa-router", "im", "+messages-send"]
+    assert argv[argv.index("--chat-id") + 1] == "oc_factory"
+    assert argv[argv.index("--msg-type") + 1] == "text"
+    sent_text = argv[argv.index("--text") + 1]
+    assert sent_text.startswith("[20261115-001] 标题\n正文 hello --chat-id oc_evil")
+    assert '<at user_id="ou_1">研发导师</at>' in sent_text
+    assert argv[argv.index("--as") + 1] == "bot"
+    for forbidden in ("--session-id", "--top-level", "--no-mention"):
+        assert forbidden not in argv
+    assert argv.count("--chat-id") == 1
+
+
 def test_send_top_level_builds_p0_verified_command(monkeypatch, sender):
     calls = _patch_run(
         monkeypatch,

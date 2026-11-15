@@ -469,7 +469,7 @@ class Coordinator:
     def _send(self, kind: str, payload: dict) -> str:
         mentions = tuple(payload.get("mentions") or ())
         if kind == "dispatch":
-            return self.sender.send_top_level(
+            return self.sender.send_seed(
                 payload["chat_id"], payload["seed_text"], mentions
             )
         if kind == "relay":
