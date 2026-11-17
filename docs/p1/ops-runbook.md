@@ -32,6 +32,7 @@
 3. 安装 `sa-im-watcher.service`,`systemctl --user daemon-reload`;先 `systemctl --user restart sa-coordinator`,并断言 `curl -fsS http://127.0.0.1:8787/healthz` 返回 `{"ok":true}`。
 4. 再 `systemctl --user enable --now sa-im-watcher`;检查首轮 cursor 从当前时间创建,不得回放历史私聊。
 5. 真机顺序:新任务 → Get → 结论卡(awaiting_go,无 dispatch)→ 对应 thread A 回「开工」→ running + 原生 text 种子。旧 `/route` 同样只能到 awaiting_go。
+6. 兼容性已实测:watcher unit 需先加载 `sa.env`(PATH)再加载 `im-watcher.env`;lark-cli 纯文本正文可直接读取;本地 naive `create_time` 先按主机时区再归一 UTC;chat 只返回话题根,必须逐 thread 拉回复并持久化 `thread_id → root_msg_id`。未文档化的 `only_thread_root_messages=false` 不可靠,禁止使用。
 
 ### 回滚顺序
 

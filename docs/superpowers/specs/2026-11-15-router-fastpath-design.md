@@ -45,7 +45,7 @@ router 的 botmux Claude 会话退出 happy path,仅保留日常寒暄与异常�
 5. **状态机**:`received → awaiting_go|clarifying`;`awaiting_go → received`(修改)或 `running`(confirm);其余不变。另保留内部 `received → running` 仅供旧 dispatch 已发出后的崩溃恢复,不作为任何 HTTP 新派单路径。awaiting_go 的 Watchdog 阈值为 24h。`/route` 非歧义分支改为写类型/标题、入队结论卡并进入 awaiting_go;`/confirm` 独享 dispatch。
 6. **`POST /confirm`**(新):body `{taskid}`;仅 awaiting_go 可 CAS 到 running 并入队 dispatch,复用 `/route` 原同事务逻辑。重复 confirm 在已 running 时幂等返回;其他状态 409。
 7. **并发与外发**:DB claim/CAS/outbox 入队持短锁;Get 与 LLM 均在全局 DB 锁外执行。结论卡入队后立即唤醒/推进 outbox,不等待固定 5s 轮询。LLM 失败返回 503,任务滞留 received;watcher 不推进游标,下一轮以同一 message_id 重试。
-8. **im_watcher**(`tools/im_watcher.py` + unit `sa-im-watcher`):经 `lark-cli --profile sa-router im +chat-messages-list --chat-id <SA_CONTROL_CHAT_ID> --as bot --no-reactions` 升序完整分页,2s 一轮;过滤 router 自己、撤回和非文本消息。首次启动从当前时间开始、不回放历史;持久 ISO 时间游标 + 2s 重叠 + message_id 幂等,原子写 journal;整轮消息成功受理后才推进,失败指数退避。
+8. **im_watcher**(`tools/im_watcher.py` + unit `sa-im-watcher`):经 `+chat-messages-list` 发现新根消息,并以 `+threads-messages-list` 展开已知 thread 回复(chat 查询只给话题根);journal 持久 `thread_id → 原始 root_msg_id` 映射、ISO UTC 时间游标与 2s 重叠。兼容 lark-cli 纯文本正文与本地 naive 时间(转主机时区后归一到 UTC)。2s 一轮、升序完整分页;过滤 router 自己、撤回和非文本消息。首次启动从当前时间开始、不回放历史;整轮消息成功受理后才原子推进,失败指数退避。
 9. **结论卡模板**:`[taskid] 类型 · 标题` / 我的理解(规范上下文摘要)/ 执行计划(角色链+轮数)/ 「在本话题回**开工**派单;要改直接说」。
 10. **种子可见性**:dispatch 使用 `lark-cli --profile sa-router im +messages-send --msg-type text`,首行 `[taskid] 标题`;mentions 转为原生 `<at user_id="ou_xxx">name</at>`。其余 relay 仍走 botmux。
 11. **sa-router SKILL.md**:改为兜底角色;保留红线与 sactl 手册。旧 `/ingest`、`/route` 保留,旧 `/route` 同样只到 awaiting_go;运维可显式 `sactl confirm` 兜底。
@@ -66,7 +66,7 @@ router 的 botmux Claude 会话退出 happy path,仅保留日常寒暄与异常�
 - awaiting_go 的 Watchdog 24h 阈值
 - 规范上下文贯穿 verdict、结论卡、种子 brief
 - 结论卡与原生 text 种子模板、mention 渲染
-- im_watcher 首轮不回放、升序分页、自过滤、游标原子推进、重启重叠去重、失败退避
+- im_watcher 首轮不回放、chat/thread 升序分页、自过滤、纯文本与本地时间归一、thread 根映射持久化、游标原子推进、重启重叠去重、失败退避
 
 ## 方案取舍(已考虑)
 

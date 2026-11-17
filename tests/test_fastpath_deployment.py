@@ -26,14 +26,22 @@ def test_im_watcher_unit_syntax_and_entrypoint():
         capture_output=True, text=True,
     )
     assert proc.returncode == 0, proc.stderr
-    parser = configparser.ConfigParser()
+    parser = configparser.ConfigParser(strict=False)
     parser.read(unit)
     service = parser["Service"]
+    env_files = [
+        line.split("=", 1)[1]
+        for line in unit.read_text().splitlines()
+        if line.startswith("EnvironmentFile=")
+    ]
+    assert env_files == [
+        "-/home/ubuntu/.config/super-agent/sa.env",
+        "/home/ubuntu/.config/super-agent/im-watcher.env",
+    ]
     assert service["ExecStart"] == (
         "/usr/bin/python3 tools/im_watcher.py $SA_IM_WATCHER_ARGS"
     )
     assert service["Restart"] == "always"
-    assert service["EnvironmentFile"] == "/home/ubuntu/.config/super-agent/im-watcher.env"
 
 
 def test_llm_and_watcher_examples_have_placeholders_only():

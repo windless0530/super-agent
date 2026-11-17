@@ -106,14 +106,14 @@
 
 **Interfaces:**
 - Consumes: `POST /inbox`;`lark-cli --profile sa-router im +chat-messages-list --as bot --no-reactions`。
-- Produces: `LarkCliMessageReader.list_messages(chat_id, start, page_token=None) -> dict`;`CursorStore(path).load(now) / save(cursor)`;`sync_once(...) -> str`;`watch_loop(...)`;CLI 必填 `--chat-id`、至少一个 `--bot-id`。
+- Produces: `LarkCliMessageReader.list_messages(chat_id, start, page_token=None) -> dict` 与 `list_thread_messages(thread_id, page_token=None) -> dict`;`CursorStore(path).load(now) / load_threads() / save(cursor, threads)`;`sync_once(..., threads) -> str`;`watch_loop(...)`;CLI 必填 `--chat-id`、至少一个 `--bot-id`。
 
 - [ ] **Step 1: 写消息归一化失败测试**:text JSON/dict 提取正文;sender open_id 兼容嵌套/平铺;root_msg_id 优先 `root_id`,否则 message_id;过滤 bot、deleted、非 text。
-- [ ] **Step 2: 写分页与游标失败测试**:升序完整分页并传 page_token;无 journal 首次从传入 now 开始;整轮成功后原子保存;2s 重叠;空轮推进到本轮开始时间;重启加载已有 cursor。
+- [ ] **Step 2: 写分页与游标失败测试**:chat/thread 均升序完整分页并传 page_token;无 journal 首次从传入 now 开始;整轮成功后原子保存;2s 重叠(含空轮);重启加载 cursor 与 `thread_id → root_msg_id` 映射。
 - [ ] **Step 3: 写可靠投递测试**:逐条 POST `/inbox`;任一非 2xx 抛错且不保存 cursor,下轮重投;成功响应含 taskid;单轮 reader 异常由 watch_loop 指数退避且继续。
 - [ ] **Step 4: 跑测试确认失败**:Run `python3 -m pytest tests/test_im_watcher.py -q` Expected: FAIL(`ModuleNotFoundError`)。
 - [ ] **Step 5: 实现 reader 与归一化**:`SA_IM_LIST_CMD` 可覆盖,默认显式 sa-router profile、`--order asc --page-size 50 --no-reactions`;subprocess 30s 超时;按 lark-cli `ok=true` 信封读取 data.messages。
-- [ ] **Step 6: 实现 CursorStore 与 sync/watch**:journal 写同目录临时文件后 `os.replace`;首轮不回放;成功整轮才推进;HTTP 用 urllib,非 2xx 不消费;watch 默认 2s、退避 1→300s。
+- [ ] **Step 6: 实现 CursorStore 与 sync/watch**:journal 写同目录临时文件后 `os.replace`;首轮不回放;chat 根消息发现 thread,逐个展开回复并补原始 root_msg_id;成功整轮才推进 cursor 与 thread 映射;HTTP 用 urllib,非 2xx 不消费;watch 默认 2s、退避 1→300s。
 - [ ] **Step 7: 跑测试确认通过**:Run Step 4 命令 Expected: 全部 PASS。
 - [ ] **Step 8: 全量回归并提交**:Run `python3 -m pytest tests/ -q` Expected: 全绿;`git commit -m "feat: add durable control-chat IM watcher"`。
 

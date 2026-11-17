@@ -58,13 +58,32 @@ def test_normalize_flat_sender_and_root_fallback():
     lambda m: m["sender"]["sender_id"].update(open_id="ou_router"),
     lambda m: m.update(deleted=True),
     lambda m: m.update(msg_type="image"),
-    lambda m: m.update(content="not-json"),
 ])
 def test_filtered_messages_never_reach_inbox(mutate):
     iw = load_module()
     raw = raw_message()
     mutate(raw)
     assert iw.normalize_message(raw, ("ou_router",)) is None
+
+
+def test_normalize_plain_lark_text_content():
+    iw = load_module()
+    raw = raw_message()
+    raw["content"] = "请帮我调研支付网关重连方案，给出推荐。"
+    event = iw.normalize_message(raw, ())
+    assert event["text"] == "请帮我调研支付网关重连方案，给出推荐。"
+
+
+def test_naive_lark_create_time_uses_host_timezone():
+    from datetime import timedelta
+    iw = load_module()
+    raw = raw_message(create_time="2026-11-17T10:23:00")
+    event = iw.normalize_message(raw, ())
+    expected = datetime(
+        2026, 11, 17, 10, 23,
+        tzinfo=timezone(timedelta(hours=8)),
+    ).astimezone(timezone.utc).isoformat()
+    assert event["_create_time"] == expected
 
 
 def test_lark_reader_command_and_success_envelope(monkeypatch):
@@ -94,6 +113,26 @@ def test_lark_reader_command_and_success_envelope(monkeypatch):
     assert captured["kwargs"]["timeout"] == 30
 
 
+def test_thread_reader_uses_ascending_paged_shortcut(monkeypatch):
+    iw = load_module()
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout=json.dumps({
+            "ok": True, "data": {"messages": [], "has_more": False},
+        }), stderr="")
+
+    monkeypatch.setattr(iw.subprocess, "run", run)
+    iw.LarkCliMessageReader().list_thread_messages("omt_1", "cursor 2")
+    argv = calls[0]
+    assert argv[:5] == ["lark-cli", "--profile", "sa-router", "im", "+threads-messages-list"]
+    assert argv[argv.index("--thread") + 1] == "omt_1"
+    assert argv[argv.index("--order") + 1] == "asc"
+    assert argv[argv.index("--page-token") + 1] == "cursor 2"
+    assert "--no-reactions" in argv
+
+
 def test_lark_reader_rejects_error_envelope(monkeypatch):
     iw = load_module()
     monkeypatch.setattr(iw.subprocess, "run", lambda *a, **k: SimpleNamespace(
@@ -113,6 +152,13 @@ def test_cursor_store_first_start_and_atomic_restart(tmp_path):
     assert json.loads(path.read_text())["cursor"] == iso_second(200)
     assert list(path.parent.iterdir()) == [path]
     assert store.load(iso_second(300)) == iso_second(200)
+
+
+def test_cursor_store_persists_thread_root_mapping(tmp_path):
+    iw = load_module()
+    store = iw.CursorStore(tmp_path / "cursor.json")
+    store.save(iso_second(), {"omt_1": "om_root_1"})
+    assert store.load_threads() == {"omt_1": "om_root_1"}
 
 
 class PagedReader:
@@ -144,6 +190,47 @@ def test_sync_expands_pages_posts_in_order_and_overlaps_two_seconds():
     assert reader.calls == [("oc_control", iso_second(), None),
                             ("oc_control", iso_second(), "p2")]
     assert cursor == iso_second(18)
+
+
+def test_sync_accepts_native_thread_reply_with_millisecond_timestamp():
+    iw = load_module()
+    reply = raw_message(
+        "om_reply", text="开工", create_time=1794890793567, root_id="om_task_root",
+    )
+    reader = PagedReader({None: {"items": [reply], "has_more": False}})
+    posted = []
+    iw.sync_once(
+        reader, posted.append, chat_id="oc_control",
+        start="2026-11-17T04:40:00+00:00", bot_ids=(),
+        round_started="2026-11-17T04:50:00+00:00",
+    )
+    assert posted[0]["root_msg_id"] == "om_task_root"
+    assert posted[0]["text"] == "开工"
+
+
+def test_sync_expands_discovered_thread_and_binds_original_root():
+    iw = load_module()
+    root = raw_message("om_root", create_time=iso_second(10))
+    root["thread_id"] = "omt_task"
+    reply = raw_message("om_go", text="开工", create_time=iso_second(20))
+    reply["thread_id"] = "omt_task"
+
+    class ThreadReader(PagedReader):
+        def list_thread_messages(self, thread_id, page_token=None):
+            assert thread_id == "omt_task" and page_token is None
+            return {"messages": [reply], "has_more": False}
+
+    reader = ThreadReader({None: {"messages": [root], "has_more": False}})
+    posted = []
+    threads = {}
+    iw.sync_once(
+        reader, posted.append, chat_id="oc_control", start=iso_second(),
+        bot_ids=(), round_started=iso_second(30), threads=threads,
+    )
+    assert threads == {"omt_task": "om_root"}
+    assert [e["message_id"] for e in posted] == ["om_root", "om_go"]
+    assert posted[1]["root_msg_id"] == "om_root"
+    assert posted[1]["text"] == "开工"
 
 
 def test_sync_skips_pre_cursor_and_empty_round_advances():

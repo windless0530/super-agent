@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/home/ubuntu/workspace/super-agent
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/home/ubuntu/.config/super-agent/sa.env
 EnvironmentFile=/home/ubuntu/.config/super-agent/im-watcher.env
 ExecStart=/usr/bin/python3 tools/im_watcher.py $SA_IM_WATCHER_ARGS
 Restart=always
